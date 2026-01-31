@@ -163,8 +163,8 @@ private:
 	UnsignedInt m_lastDamageFrame;  // Frame when damage was last taken
 
 	// Attack timing state
-	Int m_teamsHeld;           // Number of teams waiting to attack
-	Int m_lastAttackFrame;     // Frame when last attack was launched
+	Int m_teamsHeld;                  // Number of teams waiting to attack
+	UnsignedInt m_lastAttackFrame;    // Frame when last attack was launched
 
 	// Game end tracking
 	Bool m_gameEndSent;        // True if we've sent game end notification

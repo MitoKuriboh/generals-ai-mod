@@ -1,8 +1,17 @@
-# Ignore everything starting with dot, except git files.
-.*
+# Ignore specific dot files/directories (not all - .* is too broad)
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+.env
+.env.local
+
+# Keep these git-related files
 !.gitignore
 !.gitattributes
 !.github
+!.editorconfig
 
 *.user
 *.ncb
@@ -45,3 +54,30 @@ thumbs.db
 .clang-format
 /.vscode
 /Dependencies/MaxSDK/maxsdk
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+.pytest_cache/
+.mypy_cache/
+
+# Training artifacts
+*.pt
+*.pth
+checkpoints/
+logs/
+runs/
+*.jsonl
+python_ml.tar.gz
+
+# Logs
+*.log

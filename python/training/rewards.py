@@ -9,6 +9,15 @@ Design principles:
 - Dense rewards help learning but can cause reward hacking
 - Sparse terminal rewards are more robust but slower to learn
 - We use a combination with careful weighting
+
+Usage:
+    # For training scripts without full env tracking:
+    from training.rewards import calculate_step_reward, RewardConfig
+    reward = calculate_step_reward(prev_state, current_state, RewardConfig())
+
+    # For environments with full state tracking:
+    from training.rewards import calculate_reward, RewardConfig
+    reward = calculate_reward(prev_state, current_state, action, env, RewardConfig())
 """
 
 from typing import Dict, Optional, Any
@@ -49,6 +58,67 @@ class RewardConfig:
 
 # Default configuration
 DEFAULT_CONFIG = RewardConfig()
+
+
+def calculate_step_reward(
+    prev_state: Optional[Dict],
+    current_state: Dict,
+    config: RewardConfig = DEFAULT_CONFIG
+) -> float:
+    """
+    Calculate step reward without requiring env tracking.
+
+    This is a simplified version for training scripts that don't have
+    full environment state tracking. It uses the state difference approach.
+
+    Args:
+        prev_state: Previous game state (None for first step)
+        current_state: Current game state
+        config: Reward configuration
+
+    Returns:
+        Step reward value
+    """
+    if prev_state is None:
+        return 0.0
+
+    reward = 0.0
+
+    if not config.enable_shaping:
+        return reward
+
+    # Army strength improvement (primary signal)
+    prev_strength = prev_state.get('army_strength', 1.0)
+    curr_strength = current_state.get('army_strength', 1.0)
+    strength_delta = curr_strength - prev_strength
+    reward += strength_delta * config.army_strength_bonus
+
+    # Bonus for maintaining advantage
+    if curr_strength > 1.0:
+        reward += (curr_strength - 1.0) * 0.1 * config.army_strength_bonus
+
+    # Tech advancement
+    prev_tech = prev_state.get('tech_level', 0)
+    curr_tech = current_state.get('tech_level', 0)
+    tech_delta = curr_tech - prev_tech
+    if tech_delta > 0:
+        reward += tech_delta * config.tech_advancement
+
+    # Economy improvement (income rate)
+    prev_income = prev_state.get('income', 0)
+    curr_income = current_state.get('income', 0)
+    income_delta = curr_income - prev_income
+    if income_delta > 0:
+        reward += income_delta * config.income_bonus
+
+    # Penalty for being under attack
+    if current_state.get('under_attack', 0) > 0.5:
+        reward += config.time_penalty * 2  # Double time penalty when attacked
+
+    # Small survival reward
+    reward -= config.time_penalty  # Negate default time penalty = small positive
+
+    return reward * config.shaping_scale
 
 
 def calculate_reward(

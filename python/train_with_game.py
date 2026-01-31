@@ -41,6 +41,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from training.ppo import PPOAgent, PPOConfig
 from training.model import state_dict_to_tensor, action_tensor_to_dict, STATE_DIM
+from training.rewards import calculate_step_reward, RewardConfig
+from training.config import WIN_REWARD, LOSS_REWARD
 from game_launcher import GameLauncher, Episode
 
 
@@ -89,6 +91,9 @@ class UnifiedTrainer:
         # PPO agent
         ppo_config = PPOConfig(lr=learning_rate)
         self.agent = PPOAgent(ppo_config, device=self.device)
+
+        # Reward configuration
+        self.reward_config = RewardConfig()
 
         # Paths
         self.checkpoint_dir = checkpoint_dir
@@ -297,8 +302,8 @@ class UnifiedTrainer:
         if not game_ended:
             return None
 
-        # Terminal reward
-        terminal_reward = 10.0 if victory else -10.0
+        # Terminal reward from config (±100.0)
+        terminal_reward = WIN_REWARD if victory else LOSS_REWARD
         if rewards:
             rewards[-1] += terminal_reward
         else:
@@ -318,30 +323,8 @@ class UnifiedTrainer:
         )
 
     def _calculate_reward(self, prev_state: Optional[Dict], state: Dict) -> float:
-        """Calculate step reward."""
-        if prev_state is None:
-            return 0.0
-
-        reward = 0.0
-
-        # Army strength increase
-        prev_army = prev_state.get('army_strength', 1.0)
-        curr_army = state.get('army_strength', 1.0)
-        reward += (curr_army - prev_army) * 0.5
-
-        # Tech level increase
-        prev_tech = prev_state.get('tech_level', 0)
-        curr_tech = state.get('tech_level', 0)
-        reward += (curr_tech - prev_tech) * 1.0
-
-        # Penalty for being attacked
-        if state.get('under_attack', 0) > 0.5:
-            reward -= 0.02
-
-        # Small reward for staying alive
-        reward += 0.01
-
-        return reward
+        """Calculate step reward using unified rewards module."""
+        return calculate_step_reward(prev_state, state, self.reward_config)
 
     def _save_checkpoint(self, episode: int, best: bool = False, final: bool = False):
         """Save checkpoint."""

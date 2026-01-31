@@ -107,7 +107,8 @@ class PolicyNetwork(nn.Module):
     """
     Actor-Critic Policy Network for PPO.
 
-    Uses continuous action space with Beta distribution for bounded outputs.
+    Uses Beta distribution for proper bounded [0,1] outputs with correct log-probs.
+    This avoids the log-prob corruption caused by double-clamping approaches.
     """
 
     def __init__(self, state_dim: int = STATE_DIM, action_dim: int = TOTAL_ACTION_DIM,
@@ -127,9 +128,10 @@ class PolicyNetwork(nn.Module):
             nn.ReLU(),
         )
 
-        # Actor head (policy) - outputs mean and log_std for each action
-        self.actor_mean = nn.Linear(hidden_dim, action_dim)
-        self.actor_log_std = nn.Parameter(torch.zeros(action_dim))
+        # Actor head (policy) - outputs alpha and beta parameters for Beta distribution
+        # Using softplus to ensure positive concentration parameters
+        self.actor_alpha = nn.Linear(hidden_dim, action_dim)
+        self.actor_beta = nn.Linear(hidden_dim, action_dim)
 
         # Critic head (value function) - also increased capacity
         self.critic = nn.Sequential(
@@ -149,11 +151,14 @@ class PolicyNetwork(nn.Module):
                 nn.init.orthogonal_(module.weight, gain=np.sqrt(2))
                 nn.init.constant_(module.bias, 0)
 
-        # Smaller initialization for output layers
-        nn.init.orthogonal_(self.actor_mean.weight, gain=0.01)
+        # Initialize alpha/beta outputs to produce Beta(2,2) initially (mode at 0.5)
+        nn.init.orthogonal_(self.actor_alpha.weight, gain=0.01)
+        nn.init.constant_(self.actor_alpha.bias, 1.0)  # softplus(1) ≈ 1.31
+        nn.init.orthogonal_(self.actor_beta.weight, gain=0.01)
+        nn.init.constant_(self.actor_beta.bias, 1.0)
         nn.init.orthogonal_(self.critic[-1].weight, gain=1.0)
 
-    def forward(self, state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Forward pass.
 
@@ -161,48 +166,46 @@ class PolicyNetwork(nn.Module):
             state: Batch of states [batch_size, state_dim]
 
         Returns:
-            action_mean: Mean of action distribution [batch_size, action_dim]
+            alpha: Beta distribution alpha parameter [batch_size, action_dim]
+            beta: Beta distribution beta parameter [batch_size, action_dim]
             value: State value estimate [batch_size, 1]
         """
         features = self.shared(state)
-        # Use tanh + rescale for bounded [0,1] output (avoids double-sigmoid issue)
-        action_mean = torch.tanh(self.actor_mean(features)) * 0.5 + 0.5
+        # Softplus ensures positive concentration parameters, add 1 to avoid very peaked distributions
+        alpha = F.softplus(self.actor_alpha(features)) + 1.0
+        beta = F.softplus(self.actor_beta(features)) + 1.0
         value = self.critic(features)
-        return action_mean, value
+        return alpha, beta, value
 
     def get_action(self, state: torch.Tensor, deterministic: bool = False
                    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Sample action from policy.
+        Sample action from policy using Beta distribution.
 
         Args:
             state: State tensor [batch_size, state_dim] or [state_dim]
-            deterministic: If True, return mean action instead of sampling
+            deterministic: If True, return mode of Beta distribution
 
         Returns:
-            action: Sampled action [batch_size, action_dim]
-            log_prob: Log probability of action
+            action: Sampled action in [0,1] [batch_size, action_dim]
+            log_prob: Log probability of action (properly computed)
             value: State value estimate
         """
         if state.dim() == 1:
             state = state.unsqueeze(0)
 
-        action_mean, value = self.forward(state)
+        alpha, beta, value = self.forward(state)
 
         if deterministic:
-            action = action_mean
+            # Mode of Beta distribution: (alpha - 1) / (alpha + beta - 2), clamped to [0,1]
+            action = ((alpha - 1) / (alpha + beta - 2 + 1e-8)).clamp(0, 1)
             log_prob = torch.zeros(state.size(0), device=state.device)
         else:
-            # Use Beta distribution for bounded continuous actions
-            # Reparameterize: action_mean is the mode, std controls spread
-            std = torch.exp(self.actor_log_std).expand_as(action_mean)
-            std = torch.clamp(std, min=0.01, max=0.5)
-
-            # Sample from Normal and clamp to [0,1] (no double-sigmoid)
-            dist = torch.distributions.Normal(action_mean, std)
-            action = dist.rsample().clamp(0, 1)
-
-            # Log probability (clamping has minimal effect near boundaries)
+            # Sample from Beta distribution - proper [0,1] bounded with correct log-probs
+            dist = torch.distributions.Beta(alpha, beta)
+            action = dist.rsample()
+            # Clamp to avoid exact 0 or 1 which cause log-prob issues
+            action = action.clamp(1e-6, 1 - 1e-6)
             log_prob = dist.log_prob(action).sum(dim=-1)
 
         return action.squeeze(0), log_prob.squeeze(0), value.squeeze(0)
@@ -210,25 +213,24 @@ class PolicyNetwork(nn.Module):
     def evaluate_actions(self, states: torch.Tensor, actions: torch.Tensor
                          ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Evaluate actions for PPO update.
+        Evaluate actions for PPO update using Beta distribution.
 
         Args:
             states: Batch of states [batch_size, state_dim]
             actions: Batch of actions [batch_size, action_dim]
 
         Returns:
-            log_probs: Log probabilities of actions
+            log_probs: Log probabilities of actions (correctly computed)
             values: State value estimates
             entropy: Policy entropy
         """
-        action_mean, values = self.forward(states)
+        alpha, beta, values = self.forward(states)
 
-        std = torch.exp(self.actor_log_std).expand_as(action_mean)
-        std = torch.clamp(std, min=0.01, max=0.5)
-
-        # Actions are already in [0,1] from clamp, evaluate directly
-        dist = torch.distributions.Normal(action_mean, std)
-        log_probs = dist.log_prob(actions.clamp(0.001, 0.999)).sum(dim=-1)
+        # Create Beta distribution and evaluate
+        dist = torch.distributions.Beta(alpha, beta)
+        # Clamp actions to valid Beta range to avoid numerical issues
+        actions_clamped = actions.clamp(1e-6, 1 - 1e-6)
+        log_probs = dist.log_prob(actions_clamped).sum(dim=-1)
         entropy = dist.entropy().sum(dim=-1)
 
         return log_probs, values.squeeze(-1), entropy
@@ -281,5 +283,21 @@ if __name__ == '__main__':
     actions = torch.rand(32, TOTAL_ACTION_DIM)
     log_probs, values, entropy = model.evaluate_actions(states, actions)
     print(f"\nBatch test - log_probs: {log_probs.shape}, values: {values.shape}, entropy: {entropy.mean():.3f}")
+
+    # Verify action bounds with Beta distribution
+    print("\nVerifying action bounds...")
+    for _ in range(100):
+        s = torch.randn(STATE_DIM)
+        a, _, _ = model.get_action(s)
+        assert torch.all(a >= 0) and torch.all(a <= 1), f"Action out of bounds: {a}"
+    print("  All 100 samples within [0,1] ✓")
+
+    # Verify log_probs are finite
+    print("Verifying log_prob computation...")
+    states = torch.randn(100, STATE_DIM)
+    for i in range(100):
+        a, lp, _ = model.get_action(states[i])
+        assert torch.isfinite(lp), f"Log prob not finite: {lp}"
+    print("  All log_probs finite ✓")
 
     print("\nModel test passed!")

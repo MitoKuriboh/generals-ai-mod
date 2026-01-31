@@ -5,6 +5,9 @@ Single source of truth for all training parameters.
 Import from here to ensure consistency across modules.
 """
 
+import os
+from pathlib import Path
+
 # =============================================================================
 # Dimensions (MUST match C++ MLGameState/MLRecommendation structs)
 # =============================================================================
@@ -38,12 +41,27 @@ CHECKPOINT_INTERVAL = 10  # Save checkpoint every N episodes
 HIDDEN_DIM = 256          # Hidden layer size (increased for RTS complexity)
 
 # =============================================================================
-# Paths (Windows execution environment)
+# Paths (configurable via environment variables)
 # =============================================================================
 PIPE_NAME = r'\\.\pipe\generals_ml_bridge'
-CHECKPOINT_DIR = r'C:\Users\Public\game-ai-agent\checkpoints\unified'
-LOG_DIR = r'C:\Users\Public\game-ai-agent\runs\unified_training'
-ML_LOG_PATH = r'C:\Users\Public\ml_decisions.log'
+
+# Base directory: use GENERALS_AI_DIR env var or default
+_DEFAULT_BASE = r'C:\Users\Public\game-ai-agent'
+BASE_DIR = Path(os.environ.get('GENERALS_AI_DIR', _DEFAULT_BASE))
+
+# Derived paths (auto-created if needed)
+CHECKPOINT_DIR = BASE_DIR / 'checkpoints' / 'unified'
+LOG_DIR = BASE_DIR / 'runs' / 'unified_training'
+ML_LOG_PATH = BASE_DIR / 'ml_decisions.log'
+
+# Ensure directories exist when module is imported
+CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+# Convert to strings for backward compatibility with code expecting str paths
+CHECKPOINT_DIR_STR = str(CHECKPOINT_DIR)
+LOG_DIR_STR = str(LOG_DIR)
+ML_LOG_PATH_STR = str(ML_LOG_PATH)
 
 # =============================================================================
 # Reward Configuration

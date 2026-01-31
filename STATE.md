@@ -411,6 +411,54 @@ aggression=0.0 waits 30 seconds.
 - `model.py`: Increased hidden_dim to 256, added LayerNorm, added faction parsing
 - `config.py`: Updated HIDDEN_DIM=256, REWARD_CLIP=100
 
+## Round 3 Improvements (Feb 1, 2026)
+
+### Critical C++ Fixes
+
+| Fix | File | Description |
+|-----|------|-------------|
+| Buffer overflow prevention | MLBridge.cpp | Changed sprintf→snprintf in JSON parser and path construction |
+| Null pointer safety | AILearningPlayer.cpp | Added null checks for getMoney(), getEnergy(), getPosition() |
+| Type safety | AILearningPlayer.h/cpp | Changed m_lastAttackFrame from Int to UnsignedInt |
+| Game-end detection | AILearningPlayer.cpp | Now checks ALL enemies, added 60-minute timeout handling |
+
+### Critical Python Fixes
+
+| Fix | File | Description |
+|-----|------|-------------|
+| Action distribution | model.py | Replaced Normal+clamp with Beta distribution for proper [0,1] log-probs |
+| Reward unification | train_*.py | Now use rewards.py module instead of inline calculations |
+| Terminal rewards | train_*.py | Fixed ±10→±100 to match config.py |
+| Path configuration | config.py | Use Path objects and GENERALS_AI_DIR environment variable |
+
+### New Infrastructure
+
+| Component | Location | Purpose |
+|-----------|----------|---------|
+| Test suite | python/tests/ | Unit tests for model, PPO, rewards, protocol |
+| Deploy script | scripts/deploy.bat | Automated build and deployment to Steam |
+| Health check | python/health_check.py | Environment validation before training |
+
+### Files Modified
+- `MLBridge.cpp`: 6 sprintf→snprintf fixes
+- `AILearningPlayer.cpp`: 8 null checks, improved game-end detection
+- `AILearningPlayer.h`: m_lastAttackFrame type change
+- `model.py`: Beta distribution for action space
+- `train_with_game.py`: Uses rewards module, correct terminal rewards
+- `train_manual.py`: Uses rewards module, correct terminal rewards
+- `rewards.py`: Added calculate_step_reward() function
+- `config.py`: Path objects, env var support, auto-create dirs
+- `.gitignore`: Fixed .* overmatch, added Python patterns
+
+### New Files
+- `python/tests/__init__.py`
+- `python/tests/test_model.py`
+- `python/tests/test_ppo.py`
+- `python/tests/test_rewards.py`
+- `python/tests/test_protocol.py`
+- `python/health_check.py`
+- `scripts/deploy.bat`
+
 ## Next Steps
 
 1. ~~Deploy built exe to Steam folder~~ ✓
@@ -419,10 +467,11 @@ aggression=0.0 waits 30 seconds.
 4. ~~Implement ML decision logic~~ ✓ (Jan 31, 2026)
 5. ~~Comprehensive codebase improvements~~ ✓ (Feb 1, 2026)
 6. ~~Critical bug fixes~~ ✓ (Feb 1, 2026 - Round 2)
-7. **Build game with new C++ changes**
-8. Verify ML-influenced building selection in logs
-9. Test training stability with new PPO/reward fixes
-10. Graduate to Hard AI once >80% vs Easy
+7. ~~Round 3 security/correctness fixes~~ ✓ (Feb 1, 2026 - Round 3)
+8. **Build game with new C++ changes**
+9. Run pytest python/tests/ to verify Python fixes
+10. Test training stability with Beta distribution
+11. Graduate to Hard AI once >80% vs Easy
 
 ## Phase 1: ML Decision Logic Implementation (Jan 31, 2026)
 

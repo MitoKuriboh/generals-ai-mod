@@ -221,7 +221,11 @@ Bool MLBridge::launchTrainer()
 	// Build path to Python trainer script
 	// Expected location: <game_dir>/python/train_manual.py
 	char scriptPath[MAX_PATH];
-	sprintf(scriptPath, "%s\\python\\train_manual.py", gameDir);
+	int written = snprintf(scriptPath, sizeof(scriptPath), "%s\\python\\train_manual.py", gameDir);
+	if (written < 0 || written >= (int)sizeof(scriptPath)) {
+		DEBUG_LOG(("MLBridge: Script path too long\n"));
+		return false;
+	}
 
 	// Check if script exists
 	DWORD attrs = GetFileAttributesA(scriptPath);
@@ -233,7 +237,7 @@ Bool MLBridge::launchTrainer()
 	// Build command line
 	// Use pythonw.exe for no console window, or python.exe for debugging
 	char cmdLine[MAX_PATH * 2];
-	sprintf(cmdLine, "pythonw.exe \"%s\" --episodes 9999", scriptPath);
+	snprintf(cmdLine, sizeof(cmdLine), "pythonw.exe \"%s\" --episodes 9999", scriptPath);
 
 	DEBUG_LOG(("MLBridge: Launching trainer: %s\n", cmdLine));
 
@@ -246,7 +250,7 @@ Bool MLBridge::launchTrainer()
 
 	// Set working directory to game's python folder
 	char workDir[MAX_PATH];
-	sprintf(workDir, "%s\\python", gameDir);
+	snprintf(workDir, sizeof(workDir), "%s\\python", gameDir);
 
 	// Create the process
 	BOOL success = CreateProcessA(
@@ -268,7 +272,7 @@ Bool MLBridge::launchTrainer()
 		DEBUG_LOG(("MLBridge: Failed to launch trainer, error %d\n", error));
 
 		// Try with python.exe instead (might not have pythonw)
-		sprintf(cmdLine, "python.exe \"%s\" --episodes 9999", scriptPath);
+		snprintf(cmdLine, sizeof(cmdLine), "python.exe \"%s\" --episodes 9999", scriptPath);
 		success = CreateProcessA(NULL, cmdLine, NULL, NULL, FALSE,
 			CREATE_NO_WINDOW | DETACHED_PROCESS, NULL, workDir, &si, &pi);
 
@@ -472,7 +476,7 @@ Bool MLBridge::sendGameEnd(Bool victory, Real gameTimeMinutes, Real finalArmyStr
 static Real parseJsonFloat(const char* json, const char* key, Real defaultValue)
 {
 	char searchKey[64];
-	sprintf(searchKey, "\"%s\":", key);
+	snprintf(searchKey, sizeof(searchKey), "\"%s\":", key);
 
 	const char* pos = strstr(json, searchKey);
 	if (!pos) return defaultValue;
@@ -486,7 +490,7 @@ static Real parseJsonFloat(const char* json, const char* key, Real defaultValue)
 static Int parseJsonInt(const char* json, const char* key, Int defaultValue)
 {
 	char searchKey[64];
-	sprintf(searchKey, "\"%s\":", key);
+	snprintf(searchKey, sizeof(searchKey), "\"%s\":", key);
 
 	const char* pos = strstr(json, searchKey);
 	if (!pos) return defaultValue;

@@ -160,7 +160,8 @@ void AILearningPlayer::buildGameState(MLGameState& state)
 	state.playerIndex = m_player->getPlayerIndex();
 
 	// Economy
-	UnsignedInt money = m_player->getMoney()->countMoney();
+	Money* playerMoney = m_player->getMoney();
+	UnsignedInt money = playerMoney ? playerMoney->countMoney() : 0;
 	state.money = (Real)log10((double)(money + 1));
 
 	// Income rate (calculated from frame-to-frame money change)
@@ -257,7 +258,9 @@ Real AILearningPlayer::calculateBaseThreat()
 	for (Object* obj = TheGameLogic->getFirstObject(); obj; obj = obj->getNextObject()) {
 		if (obj->getControllingPlayer() != m_player) continue;
 		if (obj->isKindOf(KINDOF_COMMANDCENTER) && !obj->isEffectivelyDead()) {
-			basePos = *obj->getPosition();
+			const Coord3D* baseCoord = obj->getPosition();
+			if (!baseCoord) continue;
+			basePos = *baseCoord;
 			hasBase = true;
 			break;
 		}
@@ -273,6 +276,7 @@ Real AILearningPlayer::calculateBaseThreat()
 		if (!obj->isKindOf(KINDOF_CAN_ATTACK)) continue;
 
 		const Coord3D* pos = obj->getPosition();
+		if (!pos) continue;
 		Real dx = pos->x - basePos.x;
 		Real dy = pos->y - basePos.y;
 		Real dist = sqrt(dx*dx + dy*dy);
@@ -318,13 +322,16 @@ Real AILearningPlayer::calculateDistanceToEnemy()
 		if (!obj->isKindOf(KINDOF_COMMANDCENTER)) continue;
 		if (obj->isEffectivelyDead()) continue;
 
+		const Coord3D* pos = obj->getPosition();
+		if (!pos) continue;
+
 		if (obj->getControllingPlayer() == m_player) {
-			myBase = *obj->getPosition();
+			myBase = *pos;
 			foundMy = true;
 		} else {
 			Player* otherPlayer = obj->getControllingPlayer();
 			if (otherPlayer && m_player->getRelationship(otherPlayer->getDefaultTeam()) == ENEMIES) {
-				enemyBase = *obj->getPosition();
+				enemyBase = *pos;
 				foundEnemy = true;
 			}
 		}
@@ -341,7 +348,8 @@ Real AILearningPlayer::calculateIncomeRate()
 {
 	if (!m_player) return 0.0f;
 
-	Real currentMoney = (Real)m_player->getMoney()->countMoney();
+	Money* playerMoney = m_player->getMoney();
+	Real currentMoney = playerMoney ? (Real)playerMoney->countMoney() : 0.0f;
 	Real income = 0.0f;
 
 	// Calculate income as money delta per second (30 logic frames = 1 second)
@@ -617,9 +625,11 @@ Bool AILearningPlayer::selectTeamToBuild()
 		buildSpecificAITeam(teamProto, false);
 		m_readyToBuildTeam = false;
 		m_teamTimer = m_teamSeconds * LOGICFRAMES_PER_SECOND;
-		if (m_player->getMoney()->countMoney() < TheAI->getAiData()->m_resourcesPoor) {
+		Money* money = m_player->getMoney();
+		UnsignedInt currentMoney = money ? money->countMoney() : 0;
+		if (currentMoney < TheAI->getAiData()->m_resourcesPoor) {
 			m_teamTimer = m_teamTimer / TheAI->getAiData()->m_teamPoorMod;
-		} else if (m_player->getMoney()->countMoney() > TheAI->getAiData()->m_resourcesWealthy) {
+		} else if (currentMoney > TheAI->getAiData()->m_resourcesWealthy) {
 			m_teamTimer = m_teamTimer / TheAI->getAiData()->m_teamWealthyMod;
 		}
 		return true;
@@ -644,7 +654,8 @@ void AILearningPlayer::processBaseBuilding()
 
 	// Iterate through build list to find candidate building
 	// and apply ML priority weights
-	Bool hasSufficientPower = m_player->getEnergy()->hasSufficientPower();
+	Energy* energy = m_player->getEnergy();
+	Bool hasSufficientPower = energy ? energy->hasSufficientPower() : true;
 	const ThingTemplate* bestPlan = NULL;
 	BuildListInfo* bestInfo = NULL;
 	Real bestWeight = 0.0f;
@@ -730,7 +741,7 @@ void AILearningPlayer::checkReadyTeams()
 	UnsignedInt holdFrames = (UnsignedInt)(holdSeconds * LOGICFRAMES_PER_SECOND);
 
 	UnsignedInt currentFrame = TheGameLogic->getFrame();
-	UnsignedInt lastAttack = (UnsignedInt)m_lastAttackFrame;
+	UnsignedInt lastAttack = m_lastAttackFrame;
 
 	// Check if enough time has passed since last attack
 	if (currentFrame < lastAttack + holdFrames) {
@@ -764,6 +775,19 @@ void AILearningPlayer::checkReadyTeams()
 // GAME END DETECTION
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
+// Helper: Check if a player has any surviving key units (CC or dozer)
+static Bool playerHasKeyUnits(Player* player)
+{
+	for (Object* obj = TheGameLogic->getFirstObject(); obj; obj = obj->getNextObject()) {
+		if (obj->getControllingPlayer() != player) continue;
+		if (obj->isEffectivelyDead()) continue;
+		if (obj->isKindOf(KINDOF_COMMANDCENTER) || obj->isKindOf(KINDOF_DOZER)) {
+			return true;
+		}
+	}
+	return false;
+}
+
 void AILearningPlayer::checkGameEnd()
 {
 	if (m_gameEndSent) return;
@@ -771,56 +795,53 @@ void AILearningPlayer::checkGameEnd()
 
 	// Don't check for game end in the first 30 seconds (units still spawning)
 	const UnsignedInt MIN_GAME_FRAMES = 30 * LOGICFRAMES_PER_SECOND;
-	if (TheGameLogic->getFrame() < MIN_GAME_FRAMES) return;
+	UnsignedInt currentFrame = TheGameLogic->getFrame();
+	if (currentFrame < MIN_GAME_FRAMES) return;
 
-	Bool hasCommandCenter = false;
-	Bool hasDozer = false;
-
-	for (Object* obj = TheGameLogic->getFirstObject(); obj; obj = obj->getNextObject()) {
-		if (obj->getControllingPlayer() != m_player) continue;
-		if (obj->isEffectivelyDead()) continue;
-
-		if (obj->isKindOf(KINDOF_COMMANDCENTER)) hasCommandCenter = true;
-		if (obj->isKindOf(KINDOF_DOZER)) hasDozer = true;
-	}
-
-	// We've lost if we have no command center and no dozer
-	if (!hasCommandCenter && !hasDozer) {
-		Real gameTime = (Real)TheGameLogic->getFrame() / (30.0f * 60.0f);
+	// Check if WE have lost (no CC and no dozer)
+	if (!playerHasKeyUnits(m_player)) {
+		Real gameTime = (Real)currentFrame / (30.0f * 60.0f);
 		m_mlBridge.sendGameEnd(false, gameTime, 0.0f);
 		m_gameEndSent = true;
-		ML_LOG(("Defeat: No CC or dozer at frame %d\n", TheGameLogic->getFrame()));
+		ML_LOG(("Defeat: No CC or dozer at frame %d\n", currentFrame));
 		return;
 	}
 
-	// Check if all enemies defeated
-	Bool anyEnemyAlive = false;
-	Bool foundAnyEnemy = false;  // Track if we found any enemy players at all
+	// Check if ALL enemies are defeated (must check every enemy player)
+	Int enemyCount = 0;
+	Int aliveEnemyCount = 0;
+
 	for (Int i = 0; i < MAX_PLAYER_COUNT; i++) {
 		Player* otherPlayer = ThePlayerList->getNthPlayer(i);
 		if (!otherPlayer || otherPlayer == m_player) continue;
 		if (m_player->getRelationship(otherPlayer->getDefaultTeam()) != ENEMIES) continue;
 
-		foundAnyEnemy = true;  // We found at least one enemy player
-
-		for (Object* obj = TheGameLogic->getFirstObject(); obj; obj = obj->getNextObject()) {
-			if (obj->getControllingPlayer() != otherPlayer) continue;
-			if (obj->isEffectivelyDead()) continue;
-			if (obj->isKindOf(KINDOF_COMMANDCENTER) || obj->isKindOf(KINDOF_DOZER)) {
-				anyEnemyAlive = true;
-				break;
-			}
+		enemyCount++;
+		if (playerHasKeyUnits(otherPlayer)) {
+			aliveEnemyCount++;
 		}
-		if (anyEnemyAlive) break;
 	}
 
-	// Only declare victory if we found enemies AND they're all dead
-	// Don't declare victory if no enemies were found (game still loading)
-	if (foundAnyEnemy && !anyEnemyAlive) {
-		Real gameTime = (Real)TheGameLogic->getFrame() / (30.0f * 60.0f);
+	// Victory only if we found enemies AND all are defeated
+	if (enemyCount > 0 && aliveEnemyCount == 0) {
+		Real gameTime = (Real)currentFrame / (30.0f * 60.0f);
 		m_mlBridge.sendGameEnd(true, gameTime, calculateArmyStrength());
 		m_gameEndSent = true;
-		ML_LOG(("Victory: All enemies defeated at frame %d\n", TheGameLogic->getFrame()));
+		ML_LOG(("Victory: All %d enemies defeated at frame %d\n", enemyCount, currentFrame));
+		return;
+	}
+
+	// Game timeout handling (optional: end as draw after 60 minutes)
+	const UnsignedInt MAX_GAME_FRAMES = 60 * 60 * LOGICFRAMES_PER_SECOND;  // 60 minutes
+	if (currentFrame >= MAX_GAME_FRAMES) {
+		Real gameTime = (Real)currentFrame / (30.0f * 60.0f);
+		Real armyStrength = calculateArmyStrength();
+		// Declare winner based on army strength
+		Bool victory = (armyStrength > 1.0f);
+		m_mlBridge.sendGameEnd(victory, gameTime, armyStrength);
+		m_gameEndSent = true;
+		ML_LOG(("Timeout: Game ended at frame %d, army ratio %.2f -> %s\n",
+			currentFrame, armyStrength, victory ? "Victory" : "Defeat"));
 	}
 }
 
@@ -835,7 +856,7 @@ void AILearningPlayer::crc( Xfer *xfer )
 
 void AILearningPlayer::xfer( Xfer *xfer )
 {
-	XferVersion currentVersion = 5;  // Bumped for new member variables
+	XferVersion currentVersion = 6;  // Bumped for m_lastAttackFrame type change to UnsignedInt
 	XferVersion version = currentVersion;
 	xfer->xferVersion( &version, currentVersion );
 
@@ -846,7 +867,7 @@ void AILearningPlayer::xfer( Xfer *xfer )
 	xfer->xferReal(&m_recentDamageTaken);
 	xfer->xferUnsignedInt(&m_lastDamageFrame);
 	xfer->xferInt(&m_teamsHeld);
-	xfer->xferInt(&m_lastAttackFrame);
+	xfer->xferUnsignedInt(&m_lastAttackFrame);
 	xfer->xferBool(&m_gameEndSent);
 }
 

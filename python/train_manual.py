@@ -74,6 +74,8 @@ def setup_logging(log_dir: str = "logs"):
 
 from training.ppo import PPOAgent, PPOConfig
 from training.model import state_dict_to_tensor, action_tensor_to_dict, STATE_DIM
+from training.rewards import calculate_step_reward, RewardConfig
+from training.config import WIN_REWARD, LOSS_REWARD
 
 # Windows named pipe support
 if sys.platform == 'win32':
@@ -125,6 +127,9 @@ class ManualTrainer:
         # PPO agent
         ppo_config = PPOConfig(lr=learning_rate)
         self.agent = PPOAgent(ppo_config, device=self.device)
+
+        # Reward configuration
+        self.reward_config = RewardConfig()
 
         # Named pipe
         self.pipe = None
@@ -290,30 +295,8 @@ class ManualTrainer:
         return action_tensor_to_dict(action)
 
     def _calculate_reward(self, prev_state: Optional[Dict], state: Dict) -> float:
-        """Calculate step reward."""
-        if prev_state is None:
-            return 0.0
-
-        reward = 0.0
-
-        # Army strength increase
-        prev_army = prev_state.get('army_strength', 1.0)
-        curr_army = state.get('army_strength', 1.0)
-        reward += (curr_army - prev_army) * 0.5
-
-        # Tech level increase
-        prev_tech = prev_state.get('tech_level', 0)
-        curr_tech = state.get('tech_level', 0)
-        reward += (curr_tech - prev_tech) * 1.0
-
-        # Penalty for being attacked
-        if state.get('under_attack', 0) > 0.5:
-            reward -= 0.02
-
-        # Small reward for staying alive
-        reward += 0.01
-
-        return reward
+        """Calculate step reward using unified rewards module."""
+        return calculate_step_reward(prev_state, state, self.reward_config)
 
     def _run_single_episode(self) -> Optional[Dict]:
         """
@@ -393,8 +376,8 @@ class ManualTrainer:
             # Disconnected mid-game
             return None
 
-        # Terminal reward
-        terminal_reward = 10.0 if victory else -10.0
+        # Terminal reward from config (±100.0)
+        terminal_reward = WIN_REWARD if victory else LOSS_REWARD
         if self.current_episode_rewards:
             self.current_episode_rewards[-1] += terminal_reward
 
