@@ -970,6 +970,9 @@ GlobalData::GlobalData()
 	m_playSizzle = TRUE;
 	m_afterIntro = FALSE;
 	m_allowExitOutOfMovies = FALSE;
+	m_autoSkirmish = FALSE;
+	m_autoSkirmishAI = 0;
+	m_autoSkirmishMap.clear();
 	m_loadScreenRender = FALSE;
   m_musicVolumeFactor = 0.5f;
  	m_SFXVolumeFactor = 0.5f;

@@ -256,13 +256,39 @@ void ScoreScreenEnableControls(Bool enable)
 extern Bool DontShowMainMenu; //KRIS
 Bool g_playMusic = FALSE;
 Bool ReplayWasPressed = FALSE;
+
+// Forward declaration for auto-skirmish restart
+extern void startAutoSkirmish(void);
+
 /** Initialize the ScoreScreen */
 //-------------------------------------------------------------------------------------------------
 void ScoreScreenInit( WindowLayout *layout, void *userData )
 {
+	// Auto-skirmish: skip score screen and immediately restart
+	if (TheGlobalData->m_autoSkirmish)
+	{
+		Bool victory = FALSE;
+		if (TheVictoryConditions)
+		{
+			victory = TheVictoryConditions->isLocalAlliedVictory();
+		}
+		DEBUG_LOG(("Auto-skirmish episode ended: %s\n", victory ? "VICTORY" : "DEFEAT"));
+
+		// Clear game data and restart
+		TheGameLogic->clearGameData(FALSE);
+		startAutoSkirmish();
+
+		// Hide the score screen
+		if (layout)
+		{
+			layout->hide(TRUE);
+		}
+		return;
+	}
+
 	//Play music after subsystems get reset including the audio...
 	g_playMusic = TRUE;
-	
+
 	if (TheGameSpyInfo)
 	{
 		DEBUG_LOG(("ScoreScreenInit(): TheGameSpyInfo->stuff(%s/%s/%s)\n", TheGameSpyInfo->getLocalBaseName().str(), TheGameSpyInfo->getLocalEmail().str(), TheGameSpyInfo->getLocalPassword().str()));

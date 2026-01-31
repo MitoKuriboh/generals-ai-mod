@@ -340,6 +340,11 @@ public:
 	Bool m_afterIntro;								///< we need to tell the game our intro is done
 	Bool m_allowExitOutOfMovies;			///< flag to allow exit out of movies only after the Intro has played
 
+	// Auto-skirmish training mode
+	Bool m_autoSkirmish;							///< Start skirmish automatically (for AI training)
+	Int m_autoSkirmishAI;							///< AI difficulty for auto-skirmish opponent (0=Easy, 1=Medium, 2=Hard, 3=Learning)
+	AsciiString m_autoSkirmishMap;		///< Map to use for auto-skirmish
+
 	Bool m_loadScreenRender;						///< flag to disallow rendering of almost everything during a loadscreen
 
 	Real m_keyboardScrollFactor;			///< Factor applied to game scrolling speed via keyboard scrolling

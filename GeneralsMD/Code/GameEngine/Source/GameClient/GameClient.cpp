@@ -83,6 +83,10 @@
 #include "GameLogic/GhostObject.h"
 #include "GameLogic/Object.h"
 #include "GameLogic/ScriptEngine.h"		// For TheScriptEngine - jkmcd
+#include "GameNetwork/GameInfo.h"
+#include "GameClient/MapUtil.h"
+#include "Common/MessageStream.h"
+#include "Common/RandomValue.h"
 #ifdef _INTERNAL
 // for occasional debugging...
 //#pragma optimize("", off)
@@ -93,6 +97,119 @@
 
 /// The GameClient singleton instance
 GameClient *TheGameClient = NULL;
+
+//-------------------------------------------------------------------------------------------------
+// Start an auto-skirmish game for AI training
+//-------------------------------------------------------------------------------------------------
+void startAutoSkirmish(void)
+{
+	DEBUG_LOG(("startAutoSkirmish: Starting auto-skirmish game\n"));
+
+	if (!TheSkirmishGameInfo)
+	{
+		DEBUG_LOG(("startAutoSkirmish: ERROR - TheSkirmishGameInfo is NULL\n"));
+		return;
+	}
+
+	// STEP 1: Reset and enter game mode
+	TheSkirmishGameInfo->reset();
+	TheSkirmishGameInfo->enterGame();
+
+	Int nextSlot = 0;
+
+	// STEP 2: Set up observer slot (slot 0) if observer mode
+	if (TheGlobalData->m_autoSkirmishObserver)
+	{
+		GameSlot *slot0 = TheSkirmishGameInfo->getSlot(0);
+		slot0->setState(SLOT_PLAYER);
+		slot0->setPlayerTemplate(PLAYERTEMPLATE_OBSERVER);
+		slot0->setColor(-1);  // Observer has no color
+		slot0->setStartPos(-1);
+		slot0->setTeamNumber(-1);
+		nextSlot = 1;
+
+		// CRITICAL: Set local IP so game can find local player
+		TheSkirmishGameInfo->setLocalIP(slot0->getIP());
+	}
+
+	// STEP 3: Set up Learning AI slot
+	GameSlot *learningSlot = TheSkirmishGameInfo->getSlot(nextSlot);
+	learningSlot->setState(SLOT_LEARNING_AI);
+	learningSlot->setColor(0);
+	learningSlot->setPlayerTemplate(-1);  // Random faction
+	learningSlot->setStartPos(-1);
+	learningSlot->setTeamNumber(-1);
+
+	// If not observer, this is the local player
+	if (!TheGlobalData->m_autoSkirmishObserver)
+	{
+		TheSkirmishGameInfo->setLocalIP(learningSlot->getIP());
+	}
+	nextSlot++;
+
+	// STEP 4: Set up opponent AI slot
+	GameSlot *opponentSlot = TheSkirmishGameInfo->getSlot(nextSlot);
+	switch (TheGlobalData->m_autoSkirmishAI)
+	{
+		case 0: opponentSlot->setState(SLOT_EASY_AI); break;
+		case 1: opponentSlot->setState(SLOT_MED_AI); break;
+		case 2: opponentSlot->setState(SLOT_BRUTAL_AI); break;
+		case 3: opponentSlot->setState(SLOT_LEARNING_AI); break;
+		default: opponentSlot->setState(SLOT_MED_AI); break;
+	}
+	opponentSlot->setColor(1);
+	opponentSlot->setPlayerTemplate(-1);
+	opponentSlot->setStartPos(-1);
+	opponentSlot->setTeamNumber(-1);
+	nextSlot++;
+
+	// STEP 5: Close remaining slots
+	for (Int i = nextSlot; i < MAX_SLOTS; ++i)
+	{
+		TheSkirmishGameInfo->getSlot(i)->setState(SLOT_CLOSED);
+	}
+
+	// STEP 6: Set map
+	AsciiString mapName = TheGlobalData->m_autoSkirmishMap;
+	if (mapName.isEmpty())
+	{
+		mapName = "maps\\alpine assault\\alpine assault.map";
+	}
+	TheSkirmishGameInfo->setMap(mapName);
+	TheWritableGlobalData->m_mapName = mapName;
+
+	// STEP 7: Set map CRC from cache
+	if (TheMapCache)
+	{
+		const MapMetaData* mapData = TheMapCache->findMap(mapName);
+		if (mapData)
+		{
+			TheSkirmishGameInfo->setMapCRC(mapData->m_CRC);
+			TheSkirmishGameInfo->setMapSize(mapData->m_filesize);
+		}
+	}
+
+	// STEP 8: Set seed and initialize random
+	Int seed = GameClientRandomValue(0, INT_MAX - 1);
+	TheSkirmishGameInfo->setSeed(seed);
+	InitGameLogicRandom(seed);
+
+	// STEP 9: Start game (sets m_inProgress = true, closes open slots)
+	TheSkirmishGameInfo->startGame(0);
+
+	// STEP 10: Send MSG_NEW_GAME
+	GameMessage *msg = TheMessageStream->appendMessage(GameMessage::MSG_NEW_GAME);
+	if (msg)
+	{
+		msg->appendIntegerArgument(GAME_SKIRMISH);
+		msg->appendIntegerArgument(DIFFICULTY_NORMAL);
+		msg->appendIntegerArgument(0);
+		msg->appendIntegerArgument(30);  // Max FPS
+	}
+
+	DEBUG_LOG(("startAutoSkirmish: Game started, map=%s, observer=%d\n",
+	           mapName.str(), TheGlobalData->m_autoSkirmishObserver));
+}
 
 //-------------------------------------------------------------------------------------------------
 GameClient::GameClient()
@@ -575,8 +692,15 @@ void GameClient::update( void )
 				
 			}
 
-			TheShell->showShellMap(TRUE);
-			TheShell->showShell();
+			if (TheGlobalData->m_autoSkirmish)
+			{
+				startAutoSkirmish();
+			}
+			else
+			{
+				TheShell->showShellMap(TRUE);
+				TheShell->showShell();
+			}
 			TheWritableGlobalData->m_afterIntro = FALSE;
 		}
 	}

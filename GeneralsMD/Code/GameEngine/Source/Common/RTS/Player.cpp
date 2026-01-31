@@ -80,6 +80,7 @@
 #include "GameLogic/AI.h"
 #include "GameLogic/AIPathfind.h"
 #include "GameLogic/AISkirmishPlayer.h"
+#include "GameLogic/AILearningPlayer.h"
 #include "GameLogic/ExperienceTracker.h"
 #include "GameLogic/Object.h"
 #include "GameLogic/Scripts.h"
@@ -907,11 +908,17 @@ void Player::initFromDict(const Dict* d)
 		}
 		Int diffInt  = d->getInt(TheKey_skirmishDifficulty, &exists);
 		GameDifficulty difficulty = TheScriptEngine->getGlobalDifficulty();
-		if (exists) 
+		if (exists)
 		{
 			difficulty = (GameDifficulty) diffInt;
 		}
-		if (m_ai) 
+		// For Learning AI difficulty, swap to AILearningPlayer
+		if (difficulty == DIFFICULTY_LEARNING && m_ai)
+		{
+			m_ai->deleteInstance();
+			m_ai = newInstance(AILearningPlayer)( this );
+		}
+		if (m_ai)
 		{
 			m_ai->setAIDifficulty(difficulty);
 		}

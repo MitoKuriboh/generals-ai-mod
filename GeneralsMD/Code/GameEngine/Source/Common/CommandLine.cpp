@@ -1131,6 +1131,43 @@ Int parseMod(char *args[], Int num)
 	return 1;
 }
 
+//=============================================================================
+// Auto-skirmish mode for training
+//=============================================================================
+Int parseAutoSkirmish(char *args[], int)
+{
+	if (TheWritableGlobalData)
+	{
+		TheWritableGlobalData->m_autoSkirmish = TRUE;
+		// Skip intro/shell when doing auto-skirmish
+		TheWritableGlobalData->m_playIntro = FALSE;
+		TheWritableGlobalData->m_afterIntro = TRUE;
+		TheWritableGlobalData->m_playSizzle = FALSE;
+		TheWritableGlobalData->m_shellMapOn = FALSE;
+		TheWritableGlobalData->m_animateWindows = FALSE;
+	}
+	return 1;
+}
+
+Int parseAIDifficulty(char *args[], int num)
+{
+	if (TheWritableGlobalData && num > 1)
+	{
+		TheWritableGlobalData->m_autoSkirmishAI = atoi(args[1]);
+	}
+	return 2;
+}
+
+Int parseSkirmishMap(char *args[], int num)
+{
+	if (TheWritableGlobalData && num > 1)
+	{
+		TheWritableGlobalData->m_autoSkirmishMap = args[1];
+		ConvertShortMapPathToLongMapPath(TheWritableGlobalData->m_autoSkirmishMap);
+	}
+	return 2;
+}
+
 static CommandLineParam params[] =
 {
 	{ "-noshellmap", parseNoShellMap },
@@ -1145,6 +1182,9 @@ static CommandLineParam params[] =
 	{ "-mod", parseMod },
 	{ "-noshaders", parseNoShaders },
 	{ "-quickstart", parseQuickStart },
+	{ "-autoSkirmish", parseAutoSkirmish },
+	{ "-aiDifficulty", parseAIDifficulty },
+	{ "-skirmishMap", parseSkirmishMap },
 
 #if (defined(_DEBUG) || defined(_INTERNAL))
 	{ "-noaudio", parseNoAudio },

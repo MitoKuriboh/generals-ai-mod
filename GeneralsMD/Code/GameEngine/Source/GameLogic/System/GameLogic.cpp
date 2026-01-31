@@ -1422,13 +1422,14 @@ void GameLogic::startNewGame( Bool loadingSaveGame )
 			}
 */
 
-			if (isSkirmishOrSkirmishReplay) 
+			if (isSkirmishOrSkirmishReplay)
 			{
 				d.setBool(TheKey_playerIsSkirmish, true);
 				switch (slot->getState()) {
 					case SLOT_EASY_AI : d.setInt(TheKey_skirmishDifficulty, DIFFICULTY_EASY); break;
 					case SLOT_MED_AI : d.setInt(TheKey_skirmishDifficulty, DIFFICULTY_NORMAL); break;
 					case SLOT_BRUTAL_AI : d.setInt(TheKey_skirmishDifficulty, DIFFICULTY_HARD); break;
+					case SLOT_LEARNING_AI : d.setInt(TheKey_skirmishDifficulty, DIFFICULTY_LEARNING); break;
 					default: break;	 // no setting.
 				}
 			}
