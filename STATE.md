@@ -192,6 +192,16 @@ Model learned to prioritize military (62%) and aircraft (80%), demonstrating mea
 - Fix: Added `{ "AILearningPlayer", 8, 8 }` to MemoryInit.cpp
 - Additional hardening: NULL checks in LoadScreen.cpp for color lookups and widget pointers
 
+**Self-Play Server Fix (Jan 31, 2026):**
+- Fixed: `KeyError: 3` crash in `self_play_server.py`
+- Root cause: Player ID tracking hardcoded as 0/1, but game sends 3/4 in skirmish with observer
+- Changes to `C:\Users\Public\game-ai-agent\self_play_server.py`:
+  - Added `PLAYER_SLOTS = [3, 4]` configuration constant
+  - Changed `wins` and `recent_rewards` from fixed dicts to dynamic dicts
+  - GAE computation now uses `np.unique(player_ids)` instead of hardcoded `[0, 1]`
+  - Checkpoint format updated with migration support for old `player0_wins`/`player1_wins`
+  - TensorBoard logging now dynamic per player ID
+
 ### Game Launcher Usage
 
 ```bash
