@@ -15,6 +15,9 @@
 #include "PreRTS.h"
 
 #include <math.h>
+#include <vector>
+#include <stdio.h>
+#include <stdarg.h>
 #include "Common/GameMemory.h"
 #include "Common/GlobalData.h"
 #include "Common/Player.h"
@@ -27,12 +30,27 @@
 #include "GameLogic/Object.h"
 #include "GameLogic/AILearningPlayer.h"
 #include "GameLogic/AI.h"
+#include "GameLogic/ScriptEngine.h"
+#include "GameLogic/LogicRandomValue.h"
 
-// Enable ML state logging
-#define DEBUG_ML_STATE 1
+// File-based ML logging (works in release builds)
+#define ENABLE_ML_FILE_LOG 1
 
-#ifdef DEBUG_ML_STATE
-#define ML_LOG(x) DEBUG_LOG(x)
+#ifdef ENABLE_ML_FILE_LOG
+static FILE* g_mlLogFile = NULL;
+static void mlLogWrite(const char* fmt, ...) {
+	if (!g_mlLogFile) {
+		g_mlLogFile = fopen("C:\\Users\\Public\\ml_decisions.log", "a");
+	}
+	if (g_mlLogFile) {
+		va_list args;
+		va_start(args, fmt);
+		vfprintf(g_mlLogFile, fmt, args);
+		va_end(args);
+		fflush(g_mlLogFile);
+	}
+}
+#define ML_LOG(x) mlLogWrite x
 #else
 #define ML_LOG(x)
 #endif
@@ -64,6 +82,8 @@ AILearningPlayer::~AILearningPlayer()
 
 void AILearningPlayer::update()
 {
+	if (!m_player) return;
+
 	m_frameCounter++;
 
 	// Check for game end
@@ -292,13 +312,43 @@ Real AILearningPlayer::calculateDistanceToEnemy()
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
-// TEAM CLASSIFICATION - Simplified
+// TEAM CLASSIFICATION - Analyzes team template units
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
 TeamCategory AILearningPlayer::classifyTeam(TeamPrototype* proto)
 {
-	// Simplified: just return mixed for now
-	// Full implementation needs proper team template iteration
+	if (!proto) return TEAM_CATEGORY_MIXED;
+
+	const TeamTemplateInfo* info = proto->getTemplateInfo();
+	if (!info) return TEAM_CATEGORY_MIXED;
+
+	Int infantry = 0, vehicles = 0, aircraft = 0;
+
+	// Iterate through unit types in the team template
+	for (Int i = 0; i < info->m_numUnitsInfo; i++) {
+		const TCreateUnitsInfo& unitInfo = info->m_unitsInfo[i];
+		const ThingTemplate* tmpl = TheThingFactory->findTemplate(unitInfo.unitThingName);
+		if (!tmpl) continue;
+
+		Int count = unitInfo.maxUnits;
+		if (tmpl->isKindOf(KINDOF_INFANTRY)) {
+			infantry += count;
+		} else if (tmpl->isKindOf(KINDOF_AIRCRAFT)) {
+			aircraft += count;
+		} else if (tmpl->isKindOf(KINDOF_VEHICLE)) {
+			vehicles += count;
+		}
+	}
+
+	// Return dominant category or mixed if balanced
+	Int total = infantry + vehicles + aircraft;
+	if (total == 0) return TEAM_CATEGORY_MIXED;
+
+	// 60% threshold for dominant category
+	if (infantry * 10 > total * 6) return TEAM_CATEGORY_INFANTRY;
+	if (vehicles * 10 > total * 6) return TEAM_CATEGORY_VEHICLE;
+	if (aircraft * 10 > total * 6) return TEAM_CATEGORY_AIRCRAFT;
+
 	return TEAM_CATEGORY_MIXED;
 }
 
@@ -392,12 +442,110 @@ Int AILearningPlayer::getMinArmySizeForAttack()
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
-// DECISION METHODS - For now, just use parent logic
+// DECISION METHODS - ML-influenced decision making
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
 Bool AILearningPlayer::selectTeamToBuild()
 {
-	return AISkirmishPlayer::selectTeamToBuild();
+	// If no ML recommendations yet, use parent logic
+	if (!m_currentRecommendation.valid) {
+		return AISkirmishPlayer::selectTeamToBuild();
+	}
+
+	// Find all buildable teams at highest priority (same as parent)
+	Player::PlayerTeamList::const_iterator t;
+	const Int invalidPri = -99999;
+	Int hiPri = invalidPri;
+
+	// Collect all teams that are possible to build
+	Player::PlayerTeamList candidateList1;
+	for (t = m_player->getPlayerTeams()->begin(); t != m_player->getPlayerTeams()->end(); ++t) {
+		if (isAGoodIdeaToBuildTeam(*t)) {
+			candidateList1.push_back(*t);
+			Int pri = (*t)->getTemplateInfo()->m_productionPriority;
+			if (pri > hiPri) {
+				hiPri = pri;
+			}
+		}
+	}
+
+	// Try reinforcement first
+	if (selectTeamToReinforce(hiPri)) {
+		return true;
+	}
+
+	if (hiPri == invalidPri) {
+		return false;
+	}
+
+	// Filter to highest priority teams and calculate ML weights
+	Real totalWeight = 0.0f;
+	struct WeightedTeam {
+		TeamPrototype* proto;
+		Real weight;
+	};
+	std::vector<WeightedTeam> weightedCandidates;
+	weightedCandidates.reserve(16);
+
+	for (t = candidateList1.begin(); t != candidateList1.end(); ++t) {
+		if ((*t)->getTemplateInfo()->m_productionPriority == hiPri) {
+			TeamCategory category = classifyTeam(*t);
+			Real weight = getTeamCategoryWeight(category);
+
+			// Minimum weight of 0.1 to ensure all teams have some chance
+			weight = max(0.1f, weight);
+
+			WeightedTeam wt;
+			wt.proto = *t;
+			wt.weight = weight;
+			weightedCandidates.push_back(wt);
+			totalWeight += weight;
+
+			ML_LOG(("ML Team Selection: %s category=%d weight=%.2f (inf=%.2f veh=%.2f air=%.2f)\n",
+				(*t)->getName().str(), (int)category, weight,
+				m_currentRecommendation.preferInfantry,
+				m_currentRecommendation.preferVehicles,
+				m_currentRecommendation.preferAircraft));
+		}
+	}
+
+	if (weightedCandidates.empty() || totalWeight <= 0.0f) {
+		return false;
+	}
+
+	// Weighted random selection
+	Real randomValue = GameLogicRandomValue(0, 10000) / 10000.0f * totalWeight;
+	Real cumulative = 0.0f;
+	TeamPrototype* teamProto = NULL;
+
+	for (size_t i = 0; i < weightedCandidates.size(); i++) {
+		cumulative += weightedCandidates[i].weight;
+		if (randomValue <= cumulative) {
+			teamProto = weightedCandidates[i].proto;
+			break;
+		}
+	}
+
+	// Fallback to last team if rounding issues
+	if (!teamProto && !weightedCandidates.empty()) {
+		teamProto = weightedCandidates.back().proto;
+	}
+
+	if (teamProto) {
+		ML_LOG(("ML Team Selected: %s\n", teamProto->getName().str()));
+
+		buildSpecificAITeam(teamProto, false);
+		m_readyToBuildTeam = false;
+		m_teamTimer = m_teamSeconds * LOGICFRAMES_PER_SECOND;
+		if (m_player->getMoney()->countMoney() < TheAI->getAiData()->m_resourcesPoor) {
+			m_teamTimer = m_teamTimer / TheAI->getAiData()->m_teamPoorMod;
+		} else if (m_player->getMoney()->countMoney() > TheAI->getAiData()->m_resourcesWealthy) {
+			m_teamTimer = m_teamTimer / TheAI->getAiData()->m_teamWealthyMod;
+		}
+		return true;
+	}
+
+	return false;
 }
 
 void AILearningPlayer::processBaseBuilding()
@@ -412,6 +560,45 @@ void AILearningPlayer::processTeamBuilding()
 
 void AILearningPlayer::checkReadyTeams()
 {
+	// If no ML recommendation or high aggression, use parent logic immediately
+	if (!m_currentRecommendation.valid || m_currentRecommendation.aggression > 0.7f) {
+		AISkirmishPlayer::checkReadyTeams();
+		return;
+	}
+
+	// Low aggression: delay attacks based on aggression level
+	// At aggression=0.0, hold for 30 seconds since last attack
+	// At aggression=0.7, hold for 0 seconds
+	Real holdSeconds = (1.0f - m_currentRecommendation.aggression / 0.7f) * 30.0f;
+	UnsignedInt holdFrames = (UnsignedInt)(holdSeconds * LOGICFRAMES_PER_SECOND);
+
+	UnsignedInt currentFrame = TheGameLogic->getFrame();
+	UnsignedInt lastAttack = (UnsignedInt)m_lastAttackFrame;
+
+	// Check if enough time has passed since last attack
+	if (currentFrame < lastAttack + holdFrames) {
+		// Count ready teams for logging
+		Int readyTeams = 0;
+		for (DLINK_ITERATOR<TeamInQueue> iter = iterate_TeamReadyQueue(); !iter.done(); iter.advance()) {
+			readyTeams++;
+		}
+		if (readyTeams > 0) {
+			m_teamsHeld = readyTeams;
+			ML_LOG(("ML Attack Hold: aggr=%.2f, holding %d teams, wait %u more frames\n",
+				m_currentRecommendation.aggression, readyTeams,
+				(lastAttack + holdFrames) - currentFrame));
+		}
+		return;  // Don't attack yet
+	}
+
+	// Ready to attack - update last attack frame and proceed
+	if (m_teamsHeld > 0) {
+		ML_LOG(("ML Attack Release: aggr=%.2f, releasing %d teams\n",
+			m_currentRecommendation.aggression, m_teamsHeld));
+		m_lastAttackFrame = currentFrame;
+		m_teamsHeld = 0;
+	}
+
 	AISkirmishPlayer::checkReadyTeams();
 }
 
@@ -423,6 +610,10 @@ void AILearningPlayer::checkGameEnd()
 {
 	if (m_gameEndSent) return;
 	if (!m_player) return;
+
+	// Don't check for game end in the first 30 seconds (units still spawning)
+	const UnsignedInt MIN_GAME_FRAMES = 30 * LOGICFRAMES_PER_SECOND;
+	if (TheGameLogic->getFrame() < MIN_GAME_FRAMES) return;
 
 	Bool hasCommandCenter = false;
 	Bool hasDozer = false;

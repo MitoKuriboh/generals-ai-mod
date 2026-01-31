@@ -283,9 +283,11 @@ python evaluate_model.py eval.jsonl --summary --plot
 ## Build Status
 
 **Game Build: SUCCESSFUL ✓**
-- Build date: Jan 31, 2026
+- Build date: Jan 31, 2026 (23:36)
 - Output: `C:\dev\generals\build\win32\GeneralsMD\Release\generalszh.exe`
+- Deployed to: `C:\Program Files (x86)\Steam\steamapps\common\Command & Conquer Generals - Zero Hour\`
 - Learning AI integration complete
+- **Phase 1 ML Decision Logic: Implemented ✓**
 
 ## Unified Training Server (Jan 31, 2026)
 
@@ -322,9 +324,53 @@ python C:\Users\Public\game-ai-agent\training_server.py
 1. ~~Deploy built exe to Steam folder~~ ✓
 2. ~~Test Learning AI selection in skirmish menu~~ ✓ (Fixed Jan 31, 2026)
 3. ~~Fix pipe name mismatch for self-play~~ ✓ (Jan 31, 2026)
-4. Test unified training server with single Learning AI
-5. Test self-play (2 Learning AI players)
-6. Graduate to Hard AI once >80% vs Easy
+4. ~~Implement ML decision logic~~ ✓ (Jan 31, 2026)
+5. **Build game with new changes**
+6. Test ML-influenced gameplay (team selection, attack timing)
+7. Graduate to Hard AI once >80% vs Easy
+
+## Phase 1: ML Decision Logic Implementation (Jan 31, 2026)
+
+**Problem:** ML recommendations were being received but NOT applied to gameplay.
+Decision methods (`selectTeamToBuild`, `checkReadyTeams`) delegated to parent class.
+
+**Changes to `AILearningPlayer.cpp`:**
+
+### 1. Team Classification (`classifyTeam`)
+- Now analyzes team template's unit list
+- Iterates through `TeamTemplateInfo.m_unitsInfo[]`
+- Counts KINDOF_INFANTRY, KINDOF_VEHICLE, KINDOF_AIRCRAFT
+- Returns dominant category (60% threshold) or MIXED
+
+### 2. Team Selection (`selectTeamToBuild`)
+- ML-weighted random selection instead of uniform random
+- Gets weight from `m_currentRecommendation.preferInfantry/Vehicles/Aircraft`
+- Minimum weight of 0.1 ensures all teams have some chance
+- Logs team selection decisions for debugging
+
+### 3. Attack Timing (`checkReadyTeams`)
+- Uses aggression to control attack delay
+- High aggression (>0.7): attack immediately
+- Low aggression: delay up to 30 seconds between attacks
+- Formula: `holdSeconds = (1 - aggression/0.7) * 30`
+- Logs when teams are held and released
+
+### Debug Logging Added
+All ML decisions now logged with `ML_LOG()`:
+- Team selection: category, weight, ML preferences
+- Team selected: which team was chosen
+- Attack hold: aggression level, teams held, frames to wait
+- Attack release: when teams are unleashed
+
+### Verification Steps
+1. Build the game
+2. Start training server: `python training_server.py`
+3. Start skirmish with Learning AI
+4. Check logs for:
+   - `ML Team Selection: <name> category=X weight=Y`
+   - `ML Team Selected: <name>`
+   - `ML Attack Hold: aggr=X holding Y teams`
+   - `ML Attack Release: aggr=X releasing Y teams`
 
 ## Training Workflow
 
