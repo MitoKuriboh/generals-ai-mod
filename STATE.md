@@ -287,13 +287,44 @@ python evaluate_model.py eval.jsonl --summary --plot
 - Output: `C:\dev\generals\build\win32\GeneralsMD\Release\generalszh.exe`
 - Learning AI integration complete
 
+## Unified Training Server (Jan 31, 2026)
+
+**Problem Fixed:** Pipe name mismatch between game and self-play server
+- Game (MLBridge.h:148): `\\.\pipe\generals_ml_bridge` (single fixed name)
+- Old self_play_server.py: `\\.\pipe\generals_ml_bridge_3`, `_4` (never matched!)
+
+**Solution:** Created unified training server at `C:\Users\Public\game-ai-agent\training_server.py`
+
+Key features:
+- Uses correct pipe name that game expects
+- `PIPE_UNLIMITED_INSTANCES` allows multiple AI players to connect
+- Dynamic player detection (no hardcoded player IDs)
+- Thread-per-client architecture for self-play
+- Shared policy, pooled experiences from all players
+- Auto-reconnection between games
+
+**Files Changed:**
+- Created: `C:\Users\Public\game-ai-agent\training_server.py`
+- Updated: `C:\dev\generals\python\train_manual.py` (delegates to unified server)
+- Obsolete: `self_play_server.py`, `ml_training_server.py` (replaced by training_server.py)
+
+**Usage:**
+```bash
+# Start unified training server (handles both single-player and self-play)
+python C:\Users\Public\game-ai-agent\training_server.py
+
+# Or just start a game with Learning AI - game auto-launches trainer
+# which delegates to the unified server
+```
+
 ## Next Steps
 
 1. ~~Deploy built exe to Steam folder~~ ✓
 2. ~~Test Learning AI selection in skirmish menu~~ ✓ (Fixed Jan 31, 2026)
-3. Test manual training with `python train_manual.py`
-4. Test automated training with auto-skirmish
-5. Graduate to Hard AI once >80% vs Easy
+3. ~~Fix pipe name mismatch for self-play~~ ✓ (Jan 31, 2026)
+4. Test unified training server with single Learning AI
+5. Test self-play (2 Learning AI players)
+6. Graduate to Hard AI once >80% vs Easy
 
 ## Training Workflow
 
