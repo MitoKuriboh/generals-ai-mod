@@ -319,15 +319,110 @@ python C:\Users\Public\game-ai-agent\training_server.py
 # which delegates to the unified server
 ```
 
+## Comprehensive Improvement Phase (Feb 1, 2026)
+
+### Critical Fixes Applied
+
+| Issue | File | Fix |
+|-------|------|-----|
+| STATE_DIM mismatch | training_server.py | Changed from 25 to 44 to match model.py |
+| Double sigmoid | model.py | Replaced with tanh+rescale in forward(), clamp in get_action() |
+| Unnormalized money | model.py | Added /5.0 normalization |
+| Slow entropy decay | training_server.py | Changed from 0.999 to 0.995 |
+| Redundant clipping | training_server.py | Removed ±100 clip, rely on normalizer |
+
+### C++ Improvements
+
+| Change | Location | Description |
+|--------|----------|-------------|
+| Named constants | AILearningPlayer.h | Added MLConfig namespace with all magic numbers |
+| Income tracking | AILearningPlayer.cpp | calculateIncomeRate() tracks frame-to-frame money delta |
+| Supply tracking | AILearningPlayer.cpp | calculateSupplyUsed() approximates supply usage |
+| Under attack flag | AILearningPlayer.cpp | calculateUnderAttack() uses threat + damage tracking |
+| Building influence | AILearningPlayer.cpp | processBaseBuilding() logs and filters by ML priority |
+| Xfer version bump | AILearningPlayer.cpp | Version 4→5 for new member variables |
+
+### Architecture Cleanup
+
+| Task | Details |
+|------|---------|
+| Created config.py | Central config at python/training/config.py |
+| Deleted obsolete | Removed .old files, test_*.py, src/ from Windows |
+| Removed dead code | Deleted unused ReplayBuffer class from model.py |
+| Episode truncation | Added MAX_EPISODE_STEPS=3000 to env.py |
+
+### MLConfig Constants (C++)
+```cpp
+namespace MLConfig {
+    DECISION_INTERVAL = 30;              // Frames between ML decisions
+    MAX_ATTACK_HOLD_SECONDS = 30.0f;     // Max hold time
+    THREAT_DETECTION_RADIUS = 500.0f;    // Base threat radius
+    NORMALIZED_MAP_SCALE = 3000.0f;      // Distance normalization
+    MAX_ARMY_STRENGTH_RATIO = 2.0f;      // Strength cap
+    AGGRESSION_DEFENSIVE_THRESHOLD = 0.3f;
+    AGGRESSION_AGGRESSIVE_THRESHOLD = 0.7f;
+    MIN_PRIORITY_WEIGHT = 0.1f;
+    DELAY_THRESHOLD = 0.15f;
+}
+```
+
+### Python Config (config.py)
+```python
+STATE_DIM = 44
+ACTION_DIM = 8
+LEARNING_RATE = 3e-4
+ENTROPY_DECAY = 0.995
+MAX_EPISODE_STEPS = 3000
+```
+
+## Critical Bug Fixes (Feb 1, 2026 - Round 2)
+
+### 1. processBaseBuilding() ML Selection Fixed
+**Problem:** ML selected building was logged but parent ignored it.
+**Fix:** After finding best building based on ML weights, now calls `buildSpecificAIBuilding()`
+to mark it as priority before calling parent. Parent's processBaseBuilding() respects the priority flag.
+
+### 2. checkReadyTeams() Attack Hold Fixed
+**Problem:** Non-linear aggression handling, special case for >0.7 bypassed hold logic.
+**Fix:** Linear relationship: `holdSeconds = (1 - aggression) * 30`. Aggression=1.0 attacks immediately,
+aggression=0.0 waits 30 seconds.
+
+### 3. PPO Value Loss Clipping Fixed
+**Problem:** Clipped `values - returns` instead of `values - old_values`.
+**Fix:** Now tracks old_values in RolloutBuffer and uses correct clipping formula.
+
+### 4. Reward Imbalance Fixed
+**Problem:** Terminal rewards (±10) were 500x combat rewards (0.02).
+**Fix:** Rebalanced to win=100, loss=-100, kills=0.5, income_bonus=0.01.
+
+### 5. Network Capacity Increased
+**Problem:** 128 hidden units insufficient for RTS complexity.
+**Fix:** Increased to 256 hidden units, added LayerNorm for training stability.
+
+### 6. Faction Information Added to State
+**Problem:** No faction info in game state (USA/China/GLA).
+**Fix:** Added is_usa, is_china, is_gla one-hot encoding to MLGameState and Python parser.
+
+### Files Modified
+- `AILearningPlayer.cpp`: processBaseBuilding, checkReadyTeams, buildGameState
+- `MLBridge.h/cpp`: Added faction fields to MLGameState
+- `ppo.py`: Fixed value loss clipping, added old_values to buffer
+- `rewards.py`: Rebalanced all reward values (10x increase)
+- `model.py`: Increased hidden_dim to 256, added LayerNorm, added faction parsing
+- `config.py`: Updated HIDDEN_DIM=256, REWARD_CLIP=100
+
 ## Next Steps
 
 1. ~~Deploy built exe to Steam folder~~ ✓
 2. ~~Test Learning AI selection in skirmish menu~~ ✓ (Fixed Jan 31, 2026)
 3. ~~Fix pipe name mismatch for self-play~~ ✓ (Jan 31, 2026)
 4. ~~Implement ML decision logic~~ ✓ (Jan 31, 2026)
-5. **Build game with new changes**
-6. Test ML-influenced gameplay (team selection, attack timing)
-7. Graduate to Hard AI once >80% vs Easy
+5. ~~Comprehensive codebase improvements~~ ✓ (Feb 1, 2026)
+6. ~~Critical bug fixes~~ ✓ (Feb 1, 2026 - Round 2)
+7. **Build game with new C++ changes**
+8. Verify ML-influenced building selection in logs
+9. Test training stability with new PPO/reward fixes
+10. Graduate to Hard AI once >80% vs Easy
 
 ## Phase 1: ML Decision Logic Implementation (Jan 31, 2026)
 

@@ -18,29 +18,29 @@ from dataclasses import dataclass
 @dataclass
 class RewardConfig:
     """Configuration for reward calculation."""
-    # Terminal rewards
-    win_reward: float = 10.0
-    loss_reward: float = -10.0
+    # Terminal rewards (increased 10x for better learning signal)
+    win_reward: float = 100.0
+    loss_reward: float = -100.0
     draw_reward: float = 0.0
 
-    # Combat rewards (per unit delta)
-    enemy_unit_killed: float = 0.02
-    own_unit_lost: float = -0.02
-    enemy_building_destroyed: float = 0.1
-    own_building_lost: float = -0.15
+    # Combat rewards (increased 25x for meaningful feedback)
+    enemy_unit_killed: float = 0.5
+    own_unit_lost: float = -0.5
+    enemy_building_destroyed: float = 2.0
+    own_building_lost: float = -3.0
 
-    # Economy rewards
-    income_bonus: float = 0.001  # Per $100/s income advantage
-    money_bonus: float = 0.0001  # Per $100 wealth advantage
+    # Economy rewards (increased 10x)
+    income_bonus: float = 0.01  # Per $100/s income advantage
+    money_bonus: float = 0.001  # Per $100 wealth advantage
 
-    # Strategic rewards
-    army_strength_bonus: float = 0.05  # Per 0.1x advantage
-    tech_advancement: float = 0.02  # Per tech level gained
-    territory_control: float = 0.01  # Bonus for expanding
+    # Strategic rewards (increased for better signal)
+    army_strength_bonus: float = 0.5  # Per 0.1x advantage
+    tech_advancement: float = 0.2  # Per tech level gained
+    territory_control: float = 0.1  # Bonus for expanding
 
     # Penalty for inefficient play
-    time_penalty: float = -0.001  # Per step (encourages decisive play)
-    idle_penalty: float = -0.005  # For having no active production
+    time_penalty: float = -0.01  # Per step (encourages decisive play)
+    idle_penalty: float = -0.05  # For having no active production
 
     # Scaling factors
     shaping_scale: float = 1.0  # Scale all shaping rewards
@@ -266,9 +266,9 @@ def _count_buildings(state: Dict, prefix: str) -> int:
 EXPLORATION_CONFIG = RewardConfig(
     # Heavy shaping for early training
     shaping_scale=2.0,
-    enemy_unit_killed=0.05,
-    own_unit_lost=-0.03,
-    army_strength_bonus=0.1,
+    enemy_unit_killed=1.0,
+    own_unit_lost=-0.5,
+    army_strength_bonus=1.0,
     time_penalty=0.0,  # No time pressure
 )
 
@@ -280,16 +280,16 @@ BALANCED_CONFIG = RewardConfig(
 SPARSE_CONFIG = RewardConfig(
     # Minimal shaping, mainly terminal rewards
     shaping_scale=0.1,
-    win_reward=10.0,
-    loss_reward=-10.0,
+    win_reward=100.0,
+    loss_reward=-100.0,
 )
 
 AGGRESSIVE_CONFIG = RewardConfig(
     # Rewards aggressive play
-    enemy_unit_killed=0.05,
-    enemy_building_destroyed=0.2,
-    army_strength_bonus=0.1,
-    time_penalty=-0.002,  # Stronger time pressure
+    enemy_unit_killed=1.0,
+    enemy_building_destroyed=4.0,
+    army_strength_bonus=1.0,
+    time_penalty=-0.02,  # Stronger time pressure
 )
 
 

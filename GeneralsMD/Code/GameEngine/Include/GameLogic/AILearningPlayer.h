@@ -40,6 +40,28 @@ class BuildListInfo;
 class SpecialPowerTemplate;
 class TeamPrototype;
 
+// =============================================================================
+// ML Configuration Constants
+// =============================================================================
+namespace MLConfig {
+    // Decision timing
+    static const UnsignedInt DECISION_INTERVAL = 30;           // Frames between ML decisions (~1 sec)
+    static const Real MAX_ATTACK_HOLD_SECONDS = 30.0f;         // Max time to hold teams before attacking
+
+    // Spatial calculations
+    static const Real THREAT_DETECTION_RADIUS = 500.0f;        // Base threat detection radius
+    static const Real NORMALIZED_MAP_SCALE = 3000.0f;          // Map scale for distance normalization
+    static const Real MAX_ARMY_STRENGTH_RATIO = 2.0f;          // Cap for army strength ratio
+
+    // Aggression thresholds
+    static const Real AGGRESSION_DEFENSIVE_THRESHOLD = 0.3f;   // Below this = defensive
+    static const Real AGGRESSION_AGGRESSIVE_THRESHOLD = 0.7f;  // Above this = aggressive
+
+    // Building priorities
+    static const Real MIN_PRIORITY_WEIGHT = 0.1f;              // Minimum weight for any option
+    static const Real DELAY_THRESHOLD = 0.15f;                 // Below this = delay building
+}
+
 // Team type classification for ML-influenced selection
 enum TeamCategory
 {
@@ -135,6 +157,11 @@ private:
 	// State tracking
 	UnsignedInt m_frameCounter;
 
+	// Income tracking for state extraction
+	Real m_lastFrameMoney;     // Money from previous frame for income calculation
+	Real m_recentDamageTaken;  // Damage taken recently (for underAttack flag)
+	UnsignedInt m_lastDamageFrame;  // Frame when damage was last taken
+
 	// Attack timing state
 	Int m_teamsHeld;           // Number of teams waiting to attack
 	Int m_lastAttackFrame;     // Frame when last attack was launched
@@ -142,8 +169,10 @@ private:
 	// Game end tracking
 	Bool m_gameEndSent;        // True if we've sent game end notification
 
-	// ML decision interval (30 frames = ~1 second at 30 FPS)
-	static const UnsignedInt ML_DECISION_INTERVAL = 30;
+	// Helper methods for complete state extraction
+	Real calculateIncomeRate();
+	Real calculateSupplyUsed();
+	Real calculateUnderAttack();
 };
 
 #endif // _AI_LEARNING_PLAYER_H_

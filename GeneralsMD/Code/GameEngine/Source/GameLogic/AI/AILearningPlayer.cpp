@@ -30,6 +30,7 @@
 #include "GameLogic/Object.h"
 #include "GameLogic/AILearningPlayer.h"
 #include "GameLogic/AI.h"
+#include "GameLogic/SidesList.h"  // For BuildListInfo
 #include "GameLogic/ScriptEngine.h"
 #include "GameLogic/LogicRandomValue.h"
 
@@ -61,6 +62,9 @@ static void mlLogWrite(const char* fmt, ...) {
 
 AILearningPlayer::AILearningPlayer( Player *p ) : AISkirmishPlayer(p),
 	m_frameCounter(0),
+	m_lastFrameMoney(0.0f),
+	m_recentDamageTaken(0.0f),
+	m_lastDamageFrame(0),
 	m_teamsHeld(0),
 	m_lastAttackFrame(0),
 	m_gameEndSent(false)
@@ -89,8 +93,8 @@ void AILearningPlayer::update()
 	// Check for game end
 	checkGameEnd();
 
-	// Every 30 frames, communicate with ML bridge
-	if (m_frameCounter % ML_DECISION_INTERVAL == 0) {
+	// Communicate with ML bridge at configured interval
+	if (m_frameCounter % MLConfig::DECISION_INTERVAL == 0) {
 		exportStateToML();
 		processMLRecommendations();
 	}
@@ -102,6 +106,9 @@ void AILearningPlayer::update()
 void AILearningPlayer::newMap()
 {
 	m_frameCounter = 0;
+	m_lastFrameMoney = 0.0f;
+	m_recentDamageTaken = 0.0f;
+	m_lastDamageFrame = 0;
 	m_teamsHeld = 0;
 	m_lastAttackFrame = 0;
 	m_gameEndSent = false;
@@ -156,13 +163,19 @@ void AILearningPlayer::buildGameState(MLGameState& state)
 	UnsignedInt money = m_player->getMoney()->countMoney();
 	state.money = (Real)log10((double)(money + 1));
 
+	// Income rate (calculated from frame-to-frame money change)
+	state.incomeRate = calculateIncomeRate();
+
 	// Power
 	Energy* energy = m_player->getEnergy();
 	if (energy) {
 		state.powerBalance = (Real)(energy->getProduction() - energy->getConsumption());
 	}
 
-	// Count forces (simplified)
+	// Supply usage
+	state.supplyUsed = calculateSupplyUsed();
+
+	// Count forces
 	countForces(state.ownInfantry, state.ownVehicles, state.ownAircraft, state.ownStructures, true);
 	countForces(state.enemyInfantry, state.enemyVehicles, state.enemyAircraft, state.enemyStructures, false);
 
@@ -172,7 +185,21 @@ void AILearningPlayer::buildGameState(MLGameState& state)
 	state.baseThreat = calculateBaseThreat();
 	state.armyStrength = calculateArmyStrength();
 	state.distanceToEnemy = calculateDistanceToEnemy();
-	state.underAttack = 0.0f;
+	state.underAttack = calculateUnderAttack();
+
+	// Faction detection (one-hot encoded)
+	const PlayerTemplate* playerTemplate = m_player->getPlayerTemplate();
+	if (playerTemplate) {
+		const char* factionName = playerTemplate->getName().str();
+		// Check for faction substring in player template name
+		if (strstr(factionName, "America") != NULL || strstr(factionName, "USA") != NULL) {
+			state.isUSA = 1.0f;
+		} else if (strstr(factionName, "China") != NULL) {
+			state.isChina = 1.0f;
+		} else if (strstr(factionName, "GLA") != NULL) {
+			state.isGLA = 1.0f;
+		}
+	}
 }
 
 void AILearningPlayer::countForces(Real* infantry, Real* vehicles, Real* aircraft, Real* structures, Bool own)
@@ -239,7 +266,6 @@ Real AILearningPlayer::calculateBaseThreat()
 	if (!hasBase) return 1.0f;
 
 	Int nearbyEnemies = 0;
-	const Real threatRadius = 500.0f;
 
 	for (Object* obj = TheGameLogic->getFirstObject(); obj; obj = obj->getNextObject()) {
 		if (obj->getControllingPlayer() == m_player) continue;
@@ -251,7 +277,7 @@ Real AILearningPlayer::calculateBaseThreat()
 		Real dy = pos->y - basePos.y;
 		Real dist = sqrt(dx*dx + dy*dy);
 
-		if (dist < threatRadius) {
+		if (dist < MLConfig::THREAT_DETECTION_RADIUS) {
 			nearbyEnemies++;
 		}
 	}
@@ -278,8 +304,8 @@ Real AILearningPlayer::calculateArmyStrength()
 		}
 	}
 
-	if (enemyUnits < 1) return 2.0f;
-	return min(2.0f, (Real)ownUnits / (Real)enemyUnits);
+	if (enemyUnits < 1) return MLConfig::MAX_ARMY_STRENGTH_RATIO;
+	return min(MLConfig::MAX_ARMY_STRENGTH_RATIO, (Real)ownUnits / (Real)enemyUnits);
 }
 
 Real AILearningPlayer::calculateDistanceToEnemy()
@@ -308,7 +334,61 @@ Real AILearningPlayer::calculateDistanceToEnemy()
 
 	Real dx = enemyBase.x - myBase.x;
 	Real dy = enemyBase.y - myBase.y;
-	return min(1.0f, sqrt(dx*dx + dy*dy) / 3000.0f);
+	return min(1.0f, sqrt(dx*dx + dy*dy) / MLConfig::NORMALIZED_MAP_SCALE);
+}
+
+Real AILearningPlayer::calculateIncomeRate()
+{
+	if (!m_player) return 0.0f;
+
+	Real currentMoney = (Real)m_player->getMoney()->countMoney();
+	Real income = 0.0f;
+
+	// Calculate income as money delta per second (30 logic frames = 1 second)
+	if (m_lastFrameMoney > 0) {
+		income = (currentMoney - m_lastFrameMoney) * LOGICFRAMES_PER_SECOND / MLConfig::DECISION_INTERVAL;
+	}
+
+	m_lastFrameMoney = currentMoney;
+
+	// Normalize to reasonable range (typical income is 0-1000 per second)
+	return income / 100.0f;
+}
+
+Real AILearningPlayer::calculateSupplyUsed()
+{
+	// Supply usage isn't directly exposed in the game API
+	// Approximate based on unit counts vs typical supply limits
+	Int unitCount = 0;
+	const Int maxSupply = 100;  // Typical supply cap
+
+	for (Object* obj = TheGameLogic->getFirstObject(); obj; obj = obj->getNextObject()) {
+		if (obj->getControllingPlayer() != m_player) continue;
+		if (obj->isEffectivelyDead()) continue;
+		if (obj->isKindOf(KINDOF_INFANTRY) || obj->isKindOf(KINDOF_VEHICLE) || obj->isKindOf(KINDOF_AIRCRAFT)) {
+			unitCount++;
+		}
+	}
+
+	return min(1.0f, (Real)unitCount / (Real)maxSupply);
+}
+
+Real AILearningPlayer::calculateUnderAttack()
+{
+	// Check if any of our structures are being attacked
+	// This is approximated by checking base threat level
+	Real threat = calculateBaseThreat();
+
+	// Also check if we've taken damage recently (within 5 seconds)
+	UnsignedInt currentFrame = TheGameLogic->getFrame();
+	UnsignedInt recentWindow = 5 * LOGICFRAMES_PER_SECOND;
+
+	Bool recentlyDamaged = (currentFrame - m_lastDamageFrame) < recentWindow;
+
+	if (threat > 0.3f || recentlyDamaged) {
+		return 1.0f;
+	}
+	return 0.0f;
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
@@ -418,7 +498,7 @@ Bool AILearningPlayer::shouldDelayBuilding(BuildingCategory category)
 {
 	if (!m_currentRecommendation.valid) return false;
 	Real weight = getBuildingCategoryWeight(category);
-	return (weight < 0.15f);
+	return (weight < MLConfig::DELAY_THRESHOLD);
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
@@ -428,7 +508,7 @@ Bool AILearningPlayer::shouldDelayBuilding(BuildingCategory category)
 Bool AILearningPlayer::shouldHoldTeam()
 {
 	if (!m_currentRecommendation.valid) return false;
-	return (m_currentRecommendation.aggression < 0.3f);
+	return (m_currentRecommendation.aggression < MLConfig::AGGRESSION_DEFENSIVE_THRESHOLD);
 }
 
 Int AILearningPlayer::getMinArmySizeForAttack()
@@ -492,8 +572,8 @@ Bool AILearningPlayer::selectTeamToBuild()
 			TeamCategory category = classifyTeam(*t);
 			Real weight = getTeamCategoryWeight(category);
 
-			// Minimum weight of 0.1 to ensure all teams have some chance
-			weight = max(0.1f, weight);
+			// Minimum weight to ensure all teams have some chance
+			weight = max(MLConfig::MIN_PRIORITY_WEIGHT, weight);
 
 			WeightedTeam wt;
 			wt.proto = *t;
@@ -550,6 +630,83 @@ Bool AILearningPlayer::selectTeamToBuild()
 
 void AILearningPlayer::processBaseBuilding()
 {
+	// If no ML recommendations yet, use parent logic
+	if (!m_currentRecommendation.valid) {
+		AISkirmishPlayer::processBaseBuilding();
+		return;
+	}
+
+	// Check if we're ready to build
+	if (!m_readyToBuildStructure) {
+		AISkirmishPlayer::processBaseBuilding();
+		return;
+	}
+
+	// Iterate through build list to find candidate building
+	// and apply ML priority weights
+	Bool hasSufficientPower = m_player->getEnergy()->hasSufficientPower();
+	const ThingTemplate* bestPlan = NULL;
+	BuildListInfo* bestInfo = NULL;
+	Real bestWeight = 0.0f;
+
+	for (BuildListInfo* info = m_player->getBuildList(); info; info = info->getNext()) {
+		AsciiString name = info->getTemplateName();
+		if (name.isEmpty()) continue;
+
+		const ThingTemplate* curPlan = TheThingFactory->findTemplate(name);
+		if (!curPlan) continue;
+
+		// Skip if already built or building
+		Object* existingBldg = TheGameLogic->findObjectByID(info->getObjectID());
+		if (existingBldg && !existingBldg->isEffectivelyDead()) continue;
+
+		// Skip if already marked as priority (someone else queued it)
+		if (info->isPriorityBuild()) continue;
+
+		// Skip if on cooldown
+		if (info->getObjectTimestamp() > TheGameLogic->getFrame()) continue;
+
+		// Skip if we can't afford it or don't have prereqs
+		if (!m_player->canBuild(curPlan)) continue;
+
+		// Classify building and get weight
+		BuildingCategory category = classifyBuilding(curPlan);
+		Real weight = getBuildingCategoryWeight(category);
+
+		// Power plants get priority boost when underpowered
+		if (!hasSufficientPower && curPlan->isKindOf(KINDOF_FS_POWER)) {
+			weight += 1.0f;
+		}
+
+		// Check if this should be delayed (low priority)
+		if (shouldDelayBuilding(category)) {
+			ML_LOG(("ML Building Delay: %s category=%d weight=%.2f\n",
+				name.str(), (int)category, weight));
+			continue;
+		}
+
+		// Track best candidate
+		if (weight > bestWeight) {
+			bestWeight = weight;
+			bestPlan = curPlan;
+			bestInfo = info;
+		}
+	}
+
+	// If we found a good candidate, mark it as priority so parent builds it
+	if (bestPlan && bestInfo) {
+		ML_LOG(("ML Building Select: %s weight=%.2f (eco=%.2f def=%.2f mil=%.2f tech=%.2f)\n",
+			bestInfo->getTemplateName().str(), bestWeight,
+			m_currentRecommendation.priorityEconomy,
+			m_currentRecommendation.priorityDefense,
+			m_currentRecommendation.priorityMilitary,
+			m_currentRecommendation.priorityTech));
+
+		// Mark this building as priority - parent's processBaseBuilding will build it
+		buildSpecificAIBuilding(bestInfo->getTemplateName());
+	}
+
+	// Call parent to handle actual construction (respects priority flag we just set)
 	AISkirmishPlayer::processBaseBuilding();
 }
 
@@ -560,16 +717,16 @@ void AILearningPlayer::processTeamBuilding()
 
 void AILearningPlayer::checkReadyTeams()
 {
-	// If no ML recommendation or high aggression, use parent logic immediately
-	if (!m_currentRecommendation.valid || m_currentRecommendation.aggression > 0.7f) {
+	// If no ML recommendation, use parent logic
+	if (!m_currentRecommendation.valid) {
 		AISkirmishPlayer::checkReadyTeams();
 		return;
 	}
 
-	// Low aggression: delay attacks based on aggression level
-	// At aggression=0.0, hold for 30 seconds since last attack
-	// At aggression=0.7, hold for 0 seconds
-	Real holdSeconds = (1.0f - m_currentRecommendation.aggression / 0.7f) * 30.0f;
+	// Calculate hold time based on aggression (linear relationship)
+	// aggression=1.0 -> holdSeconds=0 (attack immediately)
+	// aggression=0.0 -> holdSeconds=30 (max delay)
+	Real holdSeconds = (1.0f - m_currentRecommendation.aggression) * MLConfig::MAX_ATTACK_HOLD_SECONDS;
 	UnsignedInt holdFrames = (UnsignedInt)(holdSeconds * LOGICFRAMES_PER_SECOND);
 
 	UnsignedInt currentFrame = TheGameLogic->getFrame();
@@ -588,16 +745,17 @@ void AILearningPlayer::checkReadyTeams()
 				m_currentRecommendation.aggression, readyTeams,
 				(lastAttack + holdFrames) - currentFrame));
 		}
-		return;  // Don't attack yet
+		// Still holding - DON'T call parent
+		return;
 	}
 
 	// Ready to attack - update last attack frame and proceed
 	if (m_teamsHeld > 0) {
 		ML_LOG(("ML Attack Release: aggr=%.2f, releasing %d teams\n",
 			m_currentRecommendation.aggression, m_teamsHeld));
-		m_lastAttackFrame = currentFrame;
 		m_teamsHeld = 0;
 	}
+	m_lastAttackFrame = currentFrame;
 
 	AISkirmishPlayer::checkReadyTeams();
 }
@@ -631,16 +789,19 @@ void AILearningPlayer::checkGameEnd()
 		Real gameTime = (Real)TheGameLogic->getFrame() / (30.0f * 60.0f);
 		m_mlBridge.sendGameEnd(false, gameTime, 0.0f);
 		m_gameEndSent = true;
-		DEBUG_LOG(("AILearningPlayer: Defeat detected\n"));
+		ML_LOG(("Defeat: No CC or dozer at frame %d\n", TheGameLogic->getFrame()));
 		return;
 	}
 
 	// Check if all enemies defeated
 	Bool anyEnemyAlive = false;
+	Bool foundAnyEnemy = false;  // Track if we found any enemy players at all
 	for (Int i = 0; i < MAX_PLAYER_COUNT; i++) {
 		Player* otherPlayer = ThePlayerList->getNthPlayer(i);
 		if (!otherPlayer || otherPlayer == m_player) continue;
 		if (m_player->getRelationship(otherPlayer->getDefaultTeam()) != ENEMIES) continue;
+
+		foundAnyEnemy = true;  // We found at least one enemy player
 
 		for (Object* obj = TheGameLogic->getFirstObject(); obj; obj = obj->getNextObject()) {
 			if (obj->getControllingPlayer() != otherPlayer) continue;
@@ -653,11 +814,13 @@ void AILearningPlayer::checkGameEnd()
 		if (anyEnemyAlive) break;
 	}
 
-	if (!anyEnemyAlive) {
+	// Only declare victory if we found enemies AND they're all dead
+	// Don't declare victory if no enemies were found (game still loading)
+	if (foundAnyEnemy && !anyEnemyAlive) {
 		Real gameTime = (Real)TheGameLogic->getFrame() / (30.0f * 60.0f);
 		m_mlBridge.sendGameEnd(true, gameTime, calculateArmyStrength());
 		m_gameEndSent = true;
-		DEBUG_LOG(("AILearningPlayer: Victory detected\n"));
+		ML_LOG(("Victory: All enemies defeated at frame %d\n", TheGameLogic->getFrame()));
 	}
 }
 
@@ -672,13 +835,16 @@ void AILearningPlayer::crc( Xfer *xfer )
 
 void AILearningPlayer::xfer( Xfer *xfer )
 {
-	XferVersion currentVersion = 4;
+	XferVersion currentVersion = 5;  // Bumped for new member variables
 	XferVersion version = currentVersion;
 	xfer->xferVersion( &version, currentVersion );
 
 	AISkirmishPlayer::xfer(xfer);
 
 	xfer->xferUnsignedInt(&m_frameCounter);
+	xfer->xferReal(&m_lastFrameMoney);
+	xfer->xferReal(&m_recentDamageTaken);
+	xfer->xferUnsignedInt(&m_lastDamageFrame);
 	xfer->xferInt(&m_teamsHeld);
 	xfer->xferInt(&m_lastAttackFrame);
 	xfer->xferBool(&m_gameEndSent);

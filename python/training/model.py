@@ -38,7 +38,7 @@ def state_dict_to_tensor(state: Dict) -> torch.Tensor:
     features = []
 
     # Economy (4)
-    features.append(state.get('money', 0))
+    features.append(state.get('money', 0) / 5.0)  # Log-scaled money, normalize to ~[0,1]
     features.append(state.get('power', 0) / 100.0)  # Normalize
     features.append(state.get('income', 0) / 10.0)
     features.append(state.get('supply', 0.5))
@@ -60,10 +60,14 @@ def state_dict_to_tensor(state: Dict) -> torch.Tensor:
     features.append(state.get('army_strength', 1.0) / 2.0)  # Normalize
     features.append(state.get('under_attack', 0))
     features.append(state.get('distance_to_enemy', 0.5))
-    features.append(0.0)  # Padding
-    features.append(0.0)  # Padding
 
-    # Ensure correct length
+    # Faction one-hot (3)
+    features.append(state.get('is_usa', 0))
+    features.append(state.get('is_china', 0))
+    features.append(state.get('is_gla', 0))
+
+    # Ensure correct length (dynamic padding to STATE_DIM=44)
+    # Current: 4 economy + 12 own + 12 enemy + 6 strategic + 3 faction = 37
     while len(features) < STATE_DIM:
         features.append(0.0)
     features = features[:STATE_DIM]
@@ -107,17 +111,19 @@ class PolicyNetwork(nn.Module):
     """
 
     def __init__(self, state_dim: int = STATE_DIM, action_dim: int = TOTAL_ACTION_DIM,
-                 hidden_dim: int = 128):
+                 hidden_dim: int = 256):  # Increased from 128 for RTS complexity
         super().__init__()
 
         self.state_dim = state_dim
         self.action_dim = action_dim
 
-        # Shared feature extractor
+        # Shared feature extractor with LayerNorm for training stability
         self.shared = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.ReLU(),
         )
 
@@ -125,9 +131,10 @@ class PolicyNetwork(nn.Module):
         self.actor_mean = nn.Linear(hidden_dim, action_dim)
         self.actor_log_std = nn.Parameter(torch.zeros(action_dim))
 
-        # Critic head (value function)
+        # Critic head (value function) - also increased capacity
         self.critic = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
             nn.ReLU(),
             nn.Linear(hidden_dim // 2, 1)
         )
@@ -158,7 +165,8 @@ class PolicyNetwork(nn.Module):
             value: State value estimate [batch_size, 1]
         """
         features = self.shared(state)
-        action_mean = torch.sigmoid(self.actor_mean(features))  # Bound to [0, 1]
+        # Use tanh + rescale for bounded [0,1] output (avoids double-sigmoid issue)
+        action_mean = torch.tanh(self.actor_mean(features)) * 0.5 + 0.5
         value = self.critic(features)
         return action_mean, value
 
@@ -190,15 +198,12 @@ class PolicyNetwork(nn.Module):
             std = torch.exp(self.actor_log_std).expand_as(action_mean)
             std = torch.clamp(std, min=0.01, max=0.5)
 
-            # Normal distribution, then sigmoid to bound
+            # Sample from Normal and clamp to [0,1] (no double-sigmoid)
             dist = torch.distributions.Normal(action_mean, std)
-            action_raw = dist.rsample()
-            action = torch.sigmoid(action_raw)
+            action = dist.rsample().clamp(0, 1)
 
-            # Log probability with correction for sigmoid transform
-            log_prob = dist.log_prob(action_raw).sum(dim=-1)
-            # Correction for sigmoid (change of variables)
-            log_prob -= torch.log(action * (1 - action) + 1e-8).sum(dim=-1)
+            # Log probability (clamping has minimal effect near boundaries)
+            log_prob = dist.log_prob(action).sum(dim=-1)
 
         return action.squeeze(0), log_prob.squeeze(0), value.squeeze(0)
 
@@ -221,14 +226,9 @@ class PolicyNetwork(nn.Module):
         std = torch.exp(self.actor_log_std).expand_as(action_mean)
         std = torch.clamp(std, min=0.01, max=0.5)
 
-        # Inverse sigmoid to get raw action
-        actions_clamped = torch.clamp(actions, 0.001, 0.999)
-        action_raw = torch.log(actions_clamped / (1 - actions_clamped))
-
+        # Actions are already in [0,1] from clamp, evaluate directly
         dist = torch.distributions.Normal(action_mean, std)
-        log_probs = dist.log_prob(action_raw).sum(dim=-1)
-        log_probs -= torch.log(actions_clamped * (1 - actions_clamped) + 1e-8).sum(dim=-1)
-
+        log_probs = dist.log_prob(actions.clamp(0.001, 0.999)).sum(dim=-1)
         entropy = dist.entropy().sum(dim=-1)
 
         return log_probs, values.squeeze(-1), entropy
@@ -251,51 +251,6 @@ class PolicyNetwork(nn.Module):
         )
         model.load_state_dict(checkpoint['state_dict'])
         return model
-
-
-class ReplayBuffer:
-    """
-    Simple replay buffer for storing trajectories.
-    """
-
-    def __init__(self, capacity: int = 10000):
-        self.capacity = capacity
-        self.buffer = []
-        self.position = 0
-
-    def push(self, state, action, reward, next_state, done, log_prob, value):
-        """Store a transition."""
-        if len(self.buffer) < self.capacity:
-            self.buffer.append(None)
-
-        self.buffer[self.position] = {
-            'state': state,
-            'action': action,
-            'reward': reward,
-            'next_state': next_state,
-            'done': done,
-            'log_prob': log_prob,
-            'value': value,
-        }
-        self.position = (self.position + 1) % self.capacity
-
-    def sample(self, batch_size: int):
-        """Sample a batch of transitions."""
-        import random
-        batch = random.sample(self.buffer, min(batch_size, len(self.buffer)))
-        return batch
-
-    def get_all(self):
-        """Get all stored transitions."""
-        return self.buffer[:len(self.buffer)]
-
-    def clear(self):
-        """Clear the buffer."""
-        self.buffer = []
-        self.position = 0
-
-    def __len__(self):
-        return len(self.buffer)
 
 
 if __name__ == '__main__':

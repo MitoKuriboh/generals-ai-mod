@@ -69,6 +69,10 @@ void MLGameState::clear()
 	armyStrength = 0.0f;
 	underAttack = 0.0f;
 	distanceToEnemy = 0.0f;
+
+	isUSA = 0.0f;
+	isChina = 0.0f;
+	isGLA = 0.0f;
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
@@ -390,7 +394,10 @@ AsciiString MLBridge::stateToJson(const MLGameState& state)
 		"\"base_threat\":%.2f,"
 		"\"army_strength\":%.2f,"
 		"\"under_attack\":%.1f,"
-		"\"distance_to_enemy\":%.2f"
+		"\"distance_to_enemy\":%.2f,"
+		"\"is_usa\":%.1f,"
+		"\"is_china\":%.1f,"
+		"\"is_gla\":%.1f"
 		"}",
 		state.playerIndex,
 		state.money,
@@ -410,7 +417,10 @@ AsciiString MLBridge::stateToJson(const MLGameState& state)
 		state.baseThreat,
 		state.armyStrength,
 		state.underAttack,
-		state.distanceToEnemy
+		state.distanceToEnemy,
+		state.isUSA,
+		state.isChina,
+		state.isGLA
 	);
 
 	return AsciiString(buffer);

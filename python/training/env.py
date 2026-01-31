@@ -30,6 +30,7 @@ else:
 
 
 PIPE_NAME = r'\\.\pipe\generals_ml_bridge'
+MAX_EPISODE_STEPS = 3000  # ~100 minutes of game time, prevents infinite episodes
 
 
 @dataclass
@@ -216,9 +217,14 @@ class GeneralsEnv:
 
         # Check for episode end
         terminated, won = self._check_terminated(state)
-        truncated = False
+        truncated = self.step_count >= MAX_EPISODE_STEPS
 
-        if terminated:
+        if truncated and not terminated:
+            # Truncated but not terminated - determine winner by army strength
+            won = state.get('army_strength', 1.0) > 1.0
+            self.episode_stats.won = won
+
+        if terminated or truncated:
             self.episode_stats.won = won
             self.episode_stats.game_time = state.get('game_time', 0)
             self.episode_stats.final_army_strength = state.get('army_strength', 0)
@@ -227,10 +233,12 @@ class GeneralsEnv:
         # Update tracking
         self._update_tracking(state)
 
+        done = terminated or truncated
         info = {
             'raw_state': state,
             'recommendation': recommendation,
-            'episode_stats': self.episode_stats if terminated else None,
+            'episode_stats': self.episode_stats if done else None,
+            'truncated': truncated,
         }
 
         return state_dict_to_tensor(state), reward, terminated, truncated, info

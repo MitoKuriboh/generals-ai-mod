@@ -109,6 +109,7 @@ class RolloutBuffer:
         states = torch.stack(self.states)
         actions = torch.stack(self.actions)
         old_log_probs = torch.stack(self.log_probs)
+        old_values = torch.stack(self.values).squeeze()  # For value clipping
         advantages = self.advantages
         returns = self.returns
 
@@ -122,6 +123,7 @@ class RolloutBuffer:
                 'states': states[batch_indices],
                 'actions': actions[batch_indices],
                 'old_log_probs': old_log_probs[batch_indices],
+                'old_values': old_values[batch_indices],  # For proper value clipping
                 'advantages': advantages[batch_indices],
                 'returns': returns[batch_indices],
             }
@@ -241,11 +243,12 @@ class PPOAgent:
                     clipped_ratio * advantages
                 ).mean()
 
-                # Value loss
+                # Value loss with proper clipping (clip value changes, not predictions)
                 if self.config.clip_value > 0:
-                    # Clipped value loss
-                    values_clipped = batch['returns'].to(self.device) + torch.clamp(
-                        values - batch['returns'].to(self.device),
+                    old_values = batch['old_values'].to(self.device)
+                    # Clip value function updates relative to old predictions
+                    values_clipped = old_values + torch.clamp(
+                        values - old_values,
                         -self.config.clip_value,
                         self.config.clip_value
                     )

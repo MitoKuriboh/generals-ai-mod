@@ -73,6 +73,11 @@ struct MLGameState
 	Real underAttack;        // 1.0 if base under attack, else 0
 	Real distanceToEnemy;    // Normalized distance to nearest enemy base
 
+	// Faction (one-hot encoded)
+	Real isUSA;              // 1.0 if playing USA, else 0
+	Real isChina;            // 1.0 if playing China, else 0
+	Real isGLA;              // 1.0 if playing GLA, else 0
+
 	// Initialize to zeros
 	void clear();
 };
