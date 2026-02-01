@@ -35,6 +35,8 @@
 #include "GameLogic/ExperienceTracker.h"
 #include "GameLogic/Module/BodyModule.h"
 #include "GameLogic/Module/AIUpdate.h"
+#include "GameLogic/Weapon.h"
+#include "GameLogic/WeaponStatus.h"
 #include "Common/ThingTemplate.h"
 
 #include <cstring>
@@ -212,15 +214,80 @@ void buildMicroState(
         outState.health = 1.0f;
     }
 
-    outState.ammunition = 1.0f;  // TODO: Track ammo if applicable
-    outState.cooldown = 0.0f;    // TODO: Get weapon cooldown
+    // Get weapon data for ammunition, cooldown, and range
+    Weapon* weapon = unit->getCurrentWeapon();
+    if (weapon)
+    {
+        // Ammunition: ratio of remaining ammo to clip size
+        Int clipSize = weapon->getClipSize();
+        if (clipSize > 0)
+        {
+            outState.ammunition = (Real)weapon->getRemainingAmmo() / (Real)clipSize;
+        }
+        else
+        {
+            outState.ammunition = 1.0f;  // Unlimited ammo
+        }
 
-    // Get locomotor speed
-    // Note: ThingTemplate doesn't expose getMaxSpeed(), use default
-    outState.speed = 0.5f;  // Default mid-speed
+        // Cooldown: based on weapon status
+        WeaponStatus status = weapon->getStatus();
+        if (status == RELOADING_CLIP)
+        {
+            // Calculate reload progress
+            Int reloadTime = weapon->getClipReloadTime(unit);
+            UnsignedInt reloadStarted = weapon->getLastReloadStartedFrame();
+            UnsignedInt currentFrame = TheGameLogic->getFrame();
+            if (reloadTime > 0)
+            {
+                Real elapsed = (Real)(currentFrame - reloadStarted);
+                outState.cooldown = fminf(elapsed / (Real)reloadTime, 1.0f);
+            }
+            else
+            {
+                outState.cooldown = 1.0f;  // Reloading
+            }
+        }
+        else if (status == BETWEEN_FIRING_SHOTS)
+        {
+            outState.cooldown = 0.5f;  // Between shots
+        }
+        else
+        {
+            outState.cooldown = 0.0f;  // Ready to fire
+        }
 
-    // TODO: Get weapon range from actual weapons
-    outState.range = 0.5f;  // Default mid-range
+        // Range: normalized weapon attack range (typical range ~300, max ~500)
+        Real attackRange = weapon->getAttackRange(unit);
+        outState.range = fminf(attackRange / 500.0f, 1.0f);
+    }
+    else
+    {
+        outState.ammunition = 1.0f;
+        outState.cooldown = 0.0f;
+        outState.range = 0.5f;  // Default mid-range for weaponless units
+    }
+
+    // Speed: estimate based on unit type (locomotor access is complex)
+    // Infantry ~40-60, Vehicles ~60-100, Aircraft ~100-150
+    if (unit->isKindOf(KINDOF_AIRCRAFT))
+    {
+        outState.speed = 0.8f;  // Fast
+    }
+    else if (unit->isKindOf(KINDOF_VEHICLE))
+    {
+        if (unit->isKindOf(KINDOF_HUGE_VEHICLE))
+            outState.speed = 0.4f;  // Slow heavy vehicle
+        else
+            outState.speed = 0.6f;  // Normal vehicle
+    }
+    else if (unit->isKindOf(KINDOF_INFANTRY))
+    {
+        outState.speed = 0.4f;  // Infantry is slow
+    }
+    else
+    {
+        outState.speed = 0.5f;  // Default
+    }
 
     outState.dps = calculateUnitDPS(unit);
 
@@ -321,9 +388,10 @@ void buildMicroState(
     }
 
     // Temporal
+    UnsignedInt currentFrame = TheGameLogic->getFrame();
+
     if (body)
     {
-        UnsignedInt currentFrame = TheGameLogic->getFrame();
         UnsignedInt lastDamage = body->getLastDamageTimestamp();
         Real framesSinceHit = (Real)(currentFrame - lastDamage);
         outState.timeSinceHit = fminf(framesSinceHit / 300.0f, 1.0f);  // Normalize to 10 seconds
@@ -333,13 +401,59 @@ void buildMicroState(
         outState.timeSinceHit = 1.0f;
     }
 
-    // TODO: Track time since shot
-    outState.timeSinceShot = 0.0f;
+    // Time since shot: based on weapon's last fire frame
+    if (weapon)
+    {
+        UnsignedInt lastShot = weapon->getLastShotFrame();
+        Real framesSinceShot = (Real)(currentFrame - lastShot);
+        outState.timeSinceShot = fminf(framesSinceShot / 150.0f, 1.0f);  // Normalize to 5 seconds
+    }
+    else
+    {
+        outState.timeSinceShot = 1.0f;  // No weapon = hasn't shot
+    }
 
-    // TODO: Track combat duration
-    outState.timeInCombat = 0.5f;
+    // Time in combat: estimate based on recent damage or recent shooting
+    // Combat is considered "active" if taking damage (30 frames) or firing (60 frames)
+    Bool inCombatRecently = FALSE;
+    if (body)
+    {
+        UnsignedInt lastDamage = body->getLastDamageTimestamp();
+        if (currentFrame - lastDamage < 60)  // 2 seconds since damage
+            inCombatRecently = TRUE;
+    }
+    if (weapon && !inCombatRecently)
+    {
+        UnsignedInt lastShot = weapon->getLastShotFrame();
+        if (currentFrame - lastShot < 90)  // 3 seconds since firing
+            inCombatRecently = TRUE;
+    }
 
-    // TODO: Track movement history
+    // Estimate combat duration (0 = just started, 1 = long engagement)
+    // This is a rough heuristic since we don't track entry time
+    if (inCombatRecently)
+    {
+        // If taking damage recently, estimate based on damage frequency
+        if (body && outState.underFire > 0.5f)
+        {
+            outState.timeInCombat = 0.8f;  // Heavy engagement
+        }
+        else if (weapon && outState.timeSinceShot < 0.3f)
+        {
+            outState.timeInCombat = 0.6f;  // Active firing
+        }
+        else
+        {
+            outState.timeInCombat = 0.4f;  // Light engagement
+        }
+    }
+    else
+    {
+        outState.timeInCombat = 0.0f;  // Not in combat
+    }
+
+    // Movement history: based on position change tracking
+    // TODO: Would need to store previous position to calculate this properly
     outState.movementHistory = 0.0f;
 }
 
@@ -548,8 +662,13 @@ void calculateKitePosition(Object* unit, const Coord3D* targetPos, Coord3D* outP
     dx /= dist;
     dy /= dist;
 
-    // Get weapon range (TODO: Get actual range from weapon)
+    // Get actual weapon range for kiting calculation
     Real weaponRange = 300.0f;  // Default range
+    Weapon* weapon = unit->getCurrentWeapon();
+    if (weapon)
+    {
+        weaponRange = weapon->getAttackRange(unit);
+    }
     Real desiredDist = weaponRange * MicroConfig::KITE_RANGE_FACTOR;
 
     // Move back to maintain desired distance

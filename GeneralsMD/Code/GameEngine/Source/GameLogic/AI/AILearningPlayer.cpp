@@ -38,6 +38,8 @@
 #include "GameLogic/TacticalState.h"
 #include "GameLogic/MicroState.h"
 #include "GameLogic/Module/AIUpdate.h"
+#include "GameLogic/Module/SpecialPowerModule.h"
+#include "Common/SpecialPower.h"
 
 // File-based ML logging (works in release builds)
 #define ENABLE_ML_FILE_LOG 1
@@ -1147,7 +1149,35 @@ void AILearningPlayer::executeTacticalCommand(Team* team, const TacticalCommand&
 			break;
 
 		case TACTICAL_SPECIAL:
-			// TODO: Implement special ability usage
+			{
+				// Find and trigger ready special abilities in the team
+				Bool abilityUsed = FALSE;
+
+				for (Object* obj = team->getFirstObject(); obj && !abilityUsed; obj = obj->getNextTeamMember())
+				{
+					if (obj->isEffectivelyDead())
+						continue;
+
+					// Search for any ready special power on this unit
+					BehaviorModule** behaviors = obj->getBehaviorModules();
+					if (!behaviors)
+						continue;
+
+					for (BehaviorModule** m = behaviors; *m && !abilityUsed; ++m)
+					{
+						SpecialPowerModuleInterface* sp = (*m)->getSpecialPower();
+						if (!sp || !sp->isReady())
+							continue;
+
+						// Trigger the special power at target location
+						sp->doSpecialPowerAtLocation(&targetPos, 0.0f, CMD_FROM_AI);
+						abilityUsed = TRUE;
+
+						ML_LOG(("TACTICAL_SPECIAL: Unit %d used special at (%.1f, %.1f)\n",
+							obj->getID(), targetPos.x, targetPos.y));
+					}
+				}
+			}
 			break;
 
 		default:
@@ -1350,7 +1380,25 @@ void AILearningPlayer::executeMicroCommand(Object* unit, const MicroCommand& cmd
 			break;
 
 		case MICRO_USE_ABILITY:
-			// TODO: Implement ability usage
+			{
+				// Find and trigger any ready special ability on this unit
+				BehaviorModule** behaviors = unit->getBehaviorModules();
+				if (behaviors)
+				{
+					for (BehaviorModule** m = behaviors; *m; ++m)
+					{
+						SpecialPowerModuleInterface* sp = (*m)->getSpecialPower();
+						if (!sp || !sp->isReady())
+							continue;
+
+						// Trigger the special power (self-targeted)
+						sp->doSpecialPower(CMD_FROM_AI);
+
+						ML_LOG(("MICRO_USE_ABILITY: Unit %d used ability\n", unit->getID()));
+						break;  // Only use one ability per command
+					}
+				}
+			}
 			break;
 
 		case MICRO_RETREAT: {

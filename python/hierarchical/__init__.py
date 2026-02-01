@@ -15,9 +15,11 @@ This module provides:
 from .coordinator import HierarchicalCoordinator
 from .batch_bridge import BatchedMLBridge
 from .sim_env import SimulatedHierarchicalEnv
+from .real_env import RealGameHierarchicalEnv
 
 __all__ = [
     'HierarchicalCoordinator',
     'BatchedMLBridge',
     'SimulatedHierarchicalEnv',
+    'RealGameHierarchicalEnv',
 ]

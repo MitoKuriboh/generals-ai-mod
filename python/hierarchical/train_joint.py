@@ -50,10 +50,16 @@ class JointTrainingConfig:
     clip_epsilon: float = 0.1  # Tighter clipping for fine-tuning
     entropy_coef: float = 0.005  # Lower entropy for exploitation
 
-    # Reward weighting
-    strategic_reward_weight: float = 1.0
-    tactical_reward_weight: float = 0.5
-    micro_reward_weight: float = 0.3
+    # Reward weighting for hierarchical credit assignment
+    # These weights control how rewards propagate upward through the hierarchy:
+    # - micro rewards → tactical layer (scaled by micro_reward_weight)
+    # - tactical rewards → strategic layer (scaled by tactical_reward_weight)
+    #
+    # Higher weights create stronger cross-layer learning signal.
+    # Set to 0.0 for independent layer optimization (no propagation).
+    strategic_reward_weight: float = 1.0   # Weight for strategic-layer terminal reward
+    tactical_reward_weight: float = 0.5    # How much tactical success affects strategic learning
+    micro_reward_weight: float = 0.3       # How much micro success affects tactical learning
 
     # Updates
     num_epochs: int = 3
@@ -78,6 +84,11 @@ class JointHierarchicalTrainer:
         self.strategic = strategic_agent
         self.tactical = tactical_agent
         self.micro = micro_agent
+
+        # LSTM hidden state tracking per unit (persists across episode steps)
+        # Key: unit_id, Value: (hidden_state, cell_state) tuple
+        self.micro_hidden_states: Dict[int, Tuple] = {}
+        self.max_hidden_states = 256  # Limit memory usage
 
         # Override learning rates
         if not self.config.freeze_strategic:
@@ -112,6 +123,9 @@ class JointHierarchicalTrainer:
         Returns:
             (total_reward, info_dict)
         """
+        # FIX: Clear LSTM hidden states at episode start for fresh temporal context
+        self.micro_hidden_states.clear()
+
         strategic_state = env.reset()
         strategic_tensor = self._state_to_tensor(strategic_state, 'strategic')
 
@@ -161,14 +175,32 @@ class JointHierarchicalTrainer:
                     micro_tensor = self._state_to_tensor(unit_state, 'micro')
 
                     if not self.config.freeze_micro:
-                        # Reset hidden state for LSTM
-                        self.micro.reset_hidden(1)
+                        # FIX: Restore hidden state for this unit if it exists
+                        # Otherwise initialize new hidden state
+                        if unit_id in self.micro_hidden_states:
+                            self.micro.hidden = self.micro_hidden_states[unit_id]
+                        else:
+                            self.micro.reset_hidden(1)
+
                         micro_action, micro_log_prob, micro_value = \
                             self.micro.select_action(micro_tensor)
+
+                        # FIX: Save hidden state for this unit after action
+                        self.micro_hidden_states[unit_id] = self.micro.hidden
+
+                        # Limit hidden state memory (LRU eviction)
+                        if len(self.micro_hidden_states) > self.max_hidden_states:
+                            oldest_key = next(iter(self.micro_hidden_states))
+                            del self.micro_hidden_states[oldest_key]
                     else:
                         with torch.no_grad():
-                            self.micro.reset_hidden(1)
+                            # Also maintain hidden state even when frozen
+                            if unit_id in self.micro_hidden_states:
+                                self.micro.hidden = self.micro_hidden_states[unit_id]
+                            else:
+                                self.micro.reset_hidden(1)
                             micro_action, _, _ = self.micro.select_action(micro_tensor)
+                            self.micro_hidden_states[unit_id] = self.micro.hidden
                         micro_log_prob = torch.tensor(0.0)
                         micro_value = torch.tensor(0.0)
 
@@ -186,6 +218,13 @@ class JointHierarchicalTrainer:
                 tactical_reward = env.apply_tactical_action(
                     team_id, self._action_to_dict(tactical_action, 'tactical')
                 )
+                # HIERARCHICAL CREDIT ASSIGNMENT:
+                # Micro rewards propagate upward to tactical layer with weighted contribution.
+                # This is intentional - tactical decisions that lead to good micro outcomes
+                # (successful engagements, kiting, target selection) get reinforced.
+                # The micro_reward_weight (default 0.3) controls the influence strength.
+                # This creates hierarchical credit assignment: good tactical positioning
+                # enables good micro, which feeds back to improve tactical learning.
                 tactical_reward += self.config.micro_reward_weight * np.mean(micro_rewards) if micro_rewards else 0
                 tactical_rewards.append(tactical_reward)
 
@@ -197,6 +236,15 @@ class JointHierarchicalTrainer:
 
             # Step environment
             next_strategic_state, strategic_reward, done, info = env.step()
+            # HIERARCHICAL CREDIT ASSIGNMENT:
+            # Tactical rewards propagate upward to strategic layer.
+            # This creates a multi-level credit assignment where strategic decisions
+            # (what to build, when to attack) that enable good tactical execution
+            # (team positioning, objective selection) get reinforced.
+            # The tactical_reward_weight (default 0.5) controls influence strength.
+            #
+            # NOTE: If layers should be trained independently (no cross-layer feedback),
+            # set tactical_reward_weight=0 and micro_reward_weight=0 in JointTrainingConfig.
             strategic_reward += self.config.tactical_reward_weight * np.mean(tactical_rewards) if tactical_rewards else 0
 
             next_strategic_tensor = self._state_to_tensor(next_strategic_state, 'strategic')
@@ -481,7 +529,14 @@ def train_joint(
         print("Using SimulatedHierarchicalEnv for training")
         env = SimulatedHierarchicalEnv(num_teams=3, units_per_team=5, episode_length=200)
     else:
-        raise NotImplementedError("Real game environment not yet implemented for joint training")
+        # Use real game environment for hierarchical training
+        from .real_env import RealGameHierarchicalEnv
+        print("Using RealGameHierarchicalEnv for training (requires game)")
+        env = RealGameHierarchicalEnv(
+            headless=True,
+            ai_difficulty=0,  # Start with Easy AI
+            map_name="Alpine Assault",
+        )
 
     print(f"Starting joint training for {num_episodes} episodes...")
 
