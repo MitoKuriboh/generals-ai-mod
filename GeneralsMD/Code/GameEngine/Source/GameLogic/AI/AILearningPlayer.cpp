@@ -22,6 +22,7 @@
 #include "Common/GlobalData.h"
 #include "Common/Player.h"
 #include "Common/PlayerList.h"
+#include "Common/PlayerTemplate.h"
 #include "Common/Xfer.h"
 #include "Common/ThingTemplate.h"
 #include "Common/ThingFactory.h"
@@ -505,6 +506,17 @@ Real AILearningPlayer::getBuildingCategoryWeight(BuildingCategory category)
 Bool AILearningPlayer::shouldDelayBuilding(BuildingCategory category)
 {
 	if (!m_currentRecommendation.valid) return false;
+
+	// CRITICAL: Never delay economy buildings when low on money
+	// This prevents the AI from starving itself to death
+	if (category == BUILDING_CATEGORY_ECONOMY) {
+		Money* money = m_player->getMoney();
+		UnsignedInt currentMoney = money ? money->countMoney() : 0;
+		if (currentMoney < 1000) {
+			return false;  // Force economy building when broke
+		}
+	}
+
 	Real weight = getBuildingCategoryWeight(category);
 	return (weight < MLConfig::DELAY_THRESHOLD);
 }
