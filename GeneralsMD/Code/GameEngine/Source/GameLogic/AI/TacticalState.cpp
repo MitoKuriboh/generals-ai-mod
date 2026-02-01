@@ -101,6 +101,16 @@ void TacticalState::toFloatArray(Real* outArray) const
     outArray[idx++] = timeSinceCommand;
     outArray[idx++] = framesSinceSpawn;
     outArray[idx++] = padding4;
+
+    // Additional padding (8)
+    outArray[idx++] = padding5;
+    outArray[idx++] = padding6;
+    outArray[idx++] = padding7;
+    outArray[idx++] = padding8;
+    outArray[idx++] = padding9;
+    outArray[idx++] = padding10;
+    outArray[idx++] = padding11;
+    outArray[idx++] = padding12;
 }
 
 // =============================================================================

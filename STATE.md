@@ -1098,9 +1098,43 @@ python -m micro.train --episodes 1000     # Micro
 
 ### Next Steps
 
-1. **Build game with hierarchical enabled** - Enable TacticalState.cpp and MicroState.cpp in CMakeLists
+1. **Build game with hierarchical enabled** - Files already in CMakeLists, build on Windows
 2. **Test with real game** - Start hierarchical server, launch skirmish with Learning AI
 3. **Fine-tune with game data** - Train tactical/micro on actual game trajectories
+
+### C++ Fixes Applied This Session
+
+| Fix | File | Description |
+|-----|------|-------------|
+| TacticalState dimensions | TacticalState.h | Added 8 padding fields (56→64 dims) to match Python |
+| TacticalState serialization | TacticalState.cpp | Updated toFloatArray() to include padding |
+
+### Windows Build Commands
+
+```powershell
+# From Visual Studio Developer Command Prompt or with VS tools in PATH
+cd C:\dev\generals\GeneralsMD
+cmake -B build -G "Visual Studio 17 2022" -A Win32
+cmake --build build --config Release
+
+# Deploy to Steam
+xcopy /Y build\Release\GeneralsMD.exe "C:\Program Files (x86)\Steam\steamapps\common\Command and Conquer Generals Zero Hour\game.dat"
+```
+
+### Test Full Hierarchical System
+
+```powershell
+# Terminal 1: Start hierarchical server
+cd C:\dev\generals\python
+python -m servers.hierarchical_server ^
+  --strategic checkpoints\best_agent.pt ^
+  --tactical checkpoints\tactical\tactical_best.pt ^
+  --micro checkpoints\micro\micro_best.pt
+
+# Terminal 2: Launch game
+# Start skirmish vs Easy AI as USA faction with Learning AI as opponent
+# Watch server logs for: tactical=True, micro=True
+```
 
 ## Phase 1: ML Decision Logic Implementation (Jan 31, 2026)
 

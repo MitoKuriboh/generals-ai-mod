@@ -129,6 +129,16 @@ struct TacticalState
     Real framesSinceSpawn;    // How long team has existed
     Real padding4;            // Reserved
 
+    // Additional padding for 64-dim alignment (8 floats)
+    Real padding5;
+    Real padding6;
+    Real padding7;
+    Real padding8;
+    Real padding9;
+    Real padding10;
+    Real padding11;
+    Real padding12;
+
     // Initialize to zeros
     void clear();
 
