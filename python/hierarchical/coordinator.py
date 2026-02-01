@@ -225,10 +225,24 @@ class HierarchicalCoordinator:
         # Build states for all teams
         states = []
         for team_id in team_ids:
-            team_state = build_tactical_state(
-                game_state, team_id, self.last_strategic_output
-            )
-            states.append(team_state.to_tensor())
+            team_data = game_state.get('teams', {}).get(str(team_id))
+
+            # Handle raw array from C++ (list of 64 floats) vs structured dict
+            if isinstance(team_data, list):
+                # Raw 64-float array from C++ - use directly as tensor
+                state_tensor = torch.tensor(team_data, dtype=torch.float32)
+            elif isinstance(team_data, dict):
+                # Structured dict (from simulation) - parse via build_tactical_state
+                team_state = build_tactical_state(
+                    game_state, team_id, self.last_strategic_output
+                )
+                state_tensor = team_state.to_tensor()
+            else:
+                # Missing data - use zeros
+                logger.warning(f"No team data for team {team_id}")
+                state_tensor = torch.zeros(64)
+
+            states.append(state_tensor)
             self.last_tactical_frame[team_id] = current_frame
 
         if not states:
@@ -275,23 +289,34 @@ class HierarchicalCoordinator:
 
         return due_units
 
-    def _should_micro_unit(self, unit_data: Dict) -> bool:
+    def _should_micro_unit(self, unit_data) -> bool:
         """Determine if a unit should receive micro control."""
-        # Micro units that are:
-        # - In combat (under fire or attacking)
-        # - High value (cost > threshold)
-        # - Have abilities ready
-        situational = unit_data.get('situational', {})
+        # Handle raw array from C++ (list of 32 floats)
+        if isinstance(unit_data, list):
+            # MicroState layout:
+            # Index 12: nearestEnemyDist (normalized)
+            # Index 18: underFire (1.0 if taking damage)
+            # Index 19: abilityReady (1.0 if ready)
+            if len(unit_data) >= 32:
+                under_fire = unit_data[18] > 0.5
+                nearby_enemies = unit_data[12] < 0.5  # Normalized distance
+                ability_ready = unit_data[19] > 0.5
+                return under_fire or nearby_enemies or ability_ready
+            return False
 
-        in_combat = (
-            situational.get('under_fire', False) or
-            situational.get('is_attacking', False)
-        )
-        nearby_enemies = situational.get('enemy_dist', 1000) < 500
-        high_value = unit_data.get('cost', 0) > 1000
-        has_ability = situational.get('ability_ready', False)
+        # Handle structured dict (from simulation)
+        if isinstance(unit_data, dict):
+            situational = unit_data.get('situational', {})
+            in_combat = (
+                situational.get('under_fire', False) or
+                situational.get('is_attacking', False)
+            )
+            nearby_enemies = situational.get('enemy_dist', 1000) < 500
+            high_value = unit_data.get('cost', 0) > 1000
+            has_ability = situational.get('ability_ready', False)
+            return in_combat or (nearby_enemies and (high_value or has_ability))
 
-        return in_combat or (nearby_enemies and (high_value or has_ability))
+        return False
 
     def _process_micro_batch(self, game_state: Dict, unit_ids: List[int],
                              current_frame: int) -> List[Dict]:
@@ -299,12 +324,21 @@ class HierarchicalCoordinator:
         results = []
 
         for unit_id in unit_ids:
-            unit_data = game_state.get('units', {}).get(str(unit_id), {})
+            unit_data = game_state.get('units', {}).get(str(unit_id))
 
-            # Build state
-            team_objective = self._get_team_objective_for_unit(game_state, unit_data)
-            unit_state = build_micro_state(unit_data, team_objective)
-            state_tensor = unit_state.to_tensor().to(self.device)
+            # Handle raw array from C++ (list of 32 floats) vs structured dict
+            if isinstance(unit_data, list):
+                # Raw 32-float array from C++ - use directly as tensor
+                state_tensor = torch.tensor(unit_data, dtype=torch.float32).to(self.device)
+            elif isinstance(unit_data, dict):
+                # Structured dict (from simulation) - parse via build_micro_state
+                team_objective = self._get_team_objective_for_unit(game_state, unit_data)
+                unit_state = build_micro_state(unit_data, team_objective)
+                state_tensor = unit_state.to_tensor().to(self.device)
+            else:
+                # Missing data - use zeros
+                logger.warning(f"No unit data for unit {unit_id}")
+                state_tensor = torch.zeros(32).to(self.device)
 
             # Get or create hidden state for this unit
             if unit_id not in self.micro_hidden_states:
@@ -328,14 +362,21 @@ class HierarchicalCoordinator:
 
         return results
 
-    def _get_team_objective_for_unit(self, game_state: Dict, unit_data: Dict) -> Dict:
+    def _get_team_objective_for_unit(self, game_state: Dict, unit_data) -> Dict:
         """Get team objective context for a unit."""
-        team_id = unit_data.get('team_id')
-        if team_id is None:
+        # Handle raw array from C++ - no team association available
+        if isinstance(unit_data, list):
             return {}
 
-        team_data = game_state.get('teams', {}).get(str(team_id), {})
-        return team_data.get('objective', {})
+        # Handle structured dict
+        if isinstance(unit_data, dict):
+            team_id = unit_data.get('team_id')
+            if team_id is None:
+                return {}
+            team_data = game_state.get('teams', {}).get(str(team_id), {})
+            return team_data.get('objective', {})
+
+        return {}
 
     def cleanup_stale_units(self, current_frame: int, max_age: int = 300):
         """Remove hidden states for units not seen recently."""
