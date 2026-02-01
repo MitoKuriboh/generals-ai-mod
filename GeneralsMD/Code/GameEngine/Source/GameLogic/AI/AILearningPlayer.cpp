@@ -901,7 +901,7 @@ Bool AILearningPlayer::teamNeedsTacticalUpdate(Team* team)
 	if (!team) return false;
 
 	TeamID teamId = team->getID();
-	if (teamId >= MAX_TRACKED_TEAMS) return false;
+	if (teamId < 0 || teamId >= MAX_TRACKED_TEAMS) return false;
 
 	UnsignedInt lastFrame = m_lastTacticalFrame[teamId];
 	UnsignedInt currentFrame = TheGameLogic->getFrame();
@@ -932,7 +932,7 @@ void AILearningPlayer::processTeamTactics()
 		executeTacticalCommand(team, cmd);
 
 		// Update tracking
-		if (cmd.teamId < MAX_TRACKED_TEAMS) {
+		if (cmd.teamId >= 0 && cmd.teamId < MAX_TRACKED_TEAMS) {
 			m_lastTacticalFrame[cmd.teamId] = TheGameLogic->getFrame();
 		}
 	}
