@@ -109,6 +109,94 @@ TBD after basic integration works.
 - Train initial models
 - Iterate on performance
 
+## Architecture Diagrams
+
+### High-Level Communication Flow
+
+```
+┌─────────────────────┐                    ┌─────────────────────┐
+│    Game (C++)       │                    │    Python ML        │
+│                     │                    │                     │
+│  ┌───────────────┐  │   Named Pipe       │  ┌───────────────┐  │
+│  │AILearningPlayer│◄─┼───────────────────┼──│ PPO Agent     │  │
+│  └───────┬───────┘  │ \\.\pipe\generals  │  └───────┬───────┘  │
+│          │          │   _ml_bridge       │          │          │
+│          ▼          │                    │          ▼          │
+│  ┌───────────────┐  │                    │  ┌───────────────┐  │
+│  │   MLBridge    │  │                    │  │ PolicyNetwork │  │
+│  │  - serialize  │──┼── JSON + 4-byte ──►│  │ (Actor-Critic)│  │
+│  │  - deserialize│◄─┼── length prefix ───┼──│               │  │
+│  └───────────────┘  │                    │  └───────────────┘  │
+│                     │                    │                     │
+└─────────────────────┘                    └─────────────────────┘
+       Windows                                   WSL / Windows
+```
+
+### Message Protocol
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│                     Message Frame                               │
+├──────────────┬─────────────────────────────────────────────────┤
+│  Length (4B) │              JSON Payload (N bytes)             │
+│  uint32 LE   │                                                  │
+├──────────────┼─────────────────────────────────────────────────┤
+│  0x2C010000  │  {"money":3.5,"power":50,"income":10,...}       │
+│  (300 bytes) │                                                  │
+└──────────────┴─────────────────────────────────────────────────┘
+```
+
+### Training Loop
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        Training Loop                             │
+│                                                                  │
+│   ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐  │
+│   │  State   │───►│  Policy  │───►│  Action  │───►│  Step    │  │
+│   │ (44-dim) │    │ Network  │    │ (8-dim)  │    │   Env    │  │
+│   └──────────┘    └──────────┘    └──────────┘    └────┬─────┘  │
+│        ▲                                               │        │
+│        │           ┌──────────┐    ┌──────────┐        │        │
+│        └───────────│  Store   │◄───│  Reward  │◄───────┘        │
+│                    │ Rollout  │    │  + Done  │                 │
+│                    └────┬─────┘    └──────────┘                 │
+│                         │                                        │
+│                         ▼                                        │
+│                    ┌──────────┐                                  │
+│                    │   PPO    │                                  │
+│                    │  Update  │──► Repeat for N episodes        │
+│                    └──────────┘                                  │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### State/Action Spaces
+
+```
+Input State (44 features):                Output Action (8 values):
+┌─────────────────────────────┐          ┌─────────────────────────┐
+│ Economy:                    │          │ priority_economy   [0,1]│
+│   money, power, income,     │          │ priority_defense   [0,1]│
+│   supply                    │          │ priority_military  [0,1]│
+├─────────────────────────────┤          │ priority_tech      [0,1]│
+│ Own Forces (4 categories):  │          ├─────────────────────────┤
+│   infantry, vehicles,       │          │ prefer_infantry    [0,1]│
+│   aircraft, structures      │          │ prefer_vehicles    [0,1]│
+│   (each: count, health, ?)  │          │ prefer_aircraft    [0,1]│
+├─────────────────────────────┤          ├─────────────────────────┤
+│ Enemy Forces (4 categories):│          │ aggression         [0,1]│
+│   (visible only via FOW)    │          │ (0=hold, 1=attack)      │
+├─────────────────────────────┤          └─────────────────────────┘
+│ Strategic:                  │
+│   game_time, tech_level,    │
+│   base_threat, army_strength│
+│   under_attack, distance    │
+└─────────────────────────────┘
+```
+
+---
+
 ## Open Design Questions
 
 1. How to handle real-time inference latency?

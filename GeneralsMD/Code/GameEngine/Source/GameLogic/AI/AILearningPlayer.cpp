@@ -31,9 +31,13 @@
 #include "GameLogic/Object.h"
 #include "GameLogic/AILearningPlayer.h"
 #include "GameLogic/AI.h"
+#include "GameLogic/Module/BodyModule.h"
 #include "GameLogic/SidesList.h"  // For BuildListInfo
 #include "GameLogic/ScriptEngine.h"
 #include "GameLogic/LogicRandomValue.h"
+#include "GameLogic/TacticalState.h"
+#include "GameLogic/MicroState.h"
+#include "GameLogic/Module/AIUpdate.h"
 
 // File-based ML logging (works in release builds)
 #define ENABLE_ML_FILE_LOG 1
@@ -68,9 +72,23 @@ AILearningPlayer::AILearningPlayer( Player *p ) : AISkirmishPlayer(p),
 	m_lastDamageFrame(0),
 	m_teamsHeld(0),
 	m_lastAttackFrame(0),
-	m_gameEndSent(false)
+	m_gameEndSent(false),
+	m_tacticalEnabled(true),
+	m_tacticalDecisionInterval(TacticalConfig::DECISION_INTERVAL),
+	m_microEnabled(true),
+	m_microDecisionInterval(MicroConfig::DECISION_INTERVAL),
+	m_trackedUnitCount(0),
+	m_hasValidBasePos(false)
 {
 	m_currentRecommendation.clear();
+
+	// Initialize tracking arrays
+	memset(m_lastTacticalFrame, 0, sizeof(m_lastTacticalFrame));
+	memset(m_lastMicroFrame, 0, sizeof(m_lastMicroFrame));
+	memset(m_trackedUnitIds, 0, sizeof(m_trackedUnitIds));
+	memset(m_strategicOutput, 0, sizeof(m_strategicOutput));
+	m_cachedBasePos.x = m_cachedBasePos.y = m_cachedBasePos.z = 0;
+
 	DEBUG_LOG(("AILearningPlayer created for player %s\n",
 		TheNameKeyGenerator->keyToName(p->getPlayerNameKey()).str()));
 }
@@ -98,6 +116,32 @@ void AILearningPlayer::update()
 	if (m_frameCounter % MLConfig::DECISION_INTERVAL == 0) {
 		exportStateToML();
 		processMLRecommendations();
+
+		// Cache strategic output for tactical layer
+		if (m_currentRecommendation.valid) {
+			m_strategicOutput[0] = m_currentRecommendation.priorityEconomy;
+			m_strategicOutput[1] = m_currentRecommendation.priorityDefense;
+			m_strategicOutput[2] = m_currentRecommendation.priorityMilitary;
+			m_strategicOutput[3] = m_currentRecommendation.priorityTech;
+			m_strategicOutput[4] = m_currentRecommendation.preferInfantry;
+			m_strategicOutput[5] = m_currentRecommendation.preferVehicles;
+			m_strategicOutput[6] = m_currentRecommendation.preferAircraft;
+			m_strategicOutput[7] = m_currentRecommendation.aggression;
+		}
+	}
+
+	// Process tactical layer for team-level decisions
+	// Only if: local config allows it, batched mode is enabled, AND server has tactical capability
+	if (m_tacticalEnabled && m_mlBridge.isBatchedModeEnabled() &&
+		m_mlBridge.getCapabilities().tactical) {
+		processTeamTactics();
+	}
+
+	// Process micro layer for unit-level decisions
+	// Only if: local config allows it, batched mode is enabled, AND server has micro capability
+	if (m_microEnabled && m_mlBridge.isBatchedModeEnabled() &&
+		m_mlBridge.getCapabilities().micro) {
+		processMicroControl();
 	}
 
 	// Run normal skirmish AI
@@ -114,6 +158,15 @@ void AILearningPlayer::newMap()
 	m_lastAttackFrame = 0;
 	m_gameEndSent = false;
 	m_currentRecommendation.clear();
+
+	// Reset hierarchical tracking
+	memset(m_lastTacticalFrame, 0, sizeof(m_lastTacticalFrame));
+	memset(m_lastMicroFrame, 0, sizeof(m_lastMicroFrame));
+	memset(m_trackedUnitIds, 0, sizeof(m_trackedUnitIds));
+	memset(m_strategicOutput, 0, sizeof(m_strategicOutput));
+	m_trackedUnitCount = 0;
+	m_hasValidBasePos = false;
+	m_cachedBasePos.x = m_cachedBasePos.y = m_cachedBasePos.z = 0;
 
 	m_mlBridge.connect();
 	AISkirmishPlayer::newMap();
@@ -146,6 +199,12 @@ void AILearningPlayer::processMLRecommendations()
 		m_currentRecommendation = rec;
 		ML_LOG(("MLBridge: aggr=%.2f eco=%.2f mil=%.2f\n",
 			rec.aggression, rec.priorityEconomy, rec.priorityMilitary));
+	} else if (m_mlBridge.isRecommendationStale()) {
+		// Recommendation is stale - revert to defaults
+		m_currentRecommendation = m_mlBridge.getValidRecommendation();
+		if (!m_currentRecommendation.valid) {
+			ML_LOG(("MLBridge: Recommendation stale, using parent AI logic\n"));
+		}
 	}
 }
 
@@ -206,12 +265,14 @@ void AILearningPlayer::buildGameState(MLGameState& state)
 
 void AILearningPlayer::countForces(Real* infantry, Real* vehicles, Real* aircraft, Real* structures, Bool own)
 {
+	// Array format: [0] = log10(count+1), [1] = avg health ratio (0-1), [2] = in production count
 	infantry[0] = infantry[1] = infantry[2] = 0.0f;
 	vehicles[0] = vehicles[1] = vehicles[2] = 0.0f;
 	aircraft[0] = aircraft[1] = aircraft[2] = 0.0f;
 	structures[0] = structures[1] = structures[2] = 0.0f;
 
 	Int infantryCount = 0, vehicleCount = 0, aircraftCount = 0, structureCount = 0;
+	Real infantryHealth = 0.0f, vehicleHealth = 0.0f, aircraftHealth = 0.0f, structureHealth = 0.0f;
 
 	for (Object* obj = TheGameLogic->getFirstObject(); obj; obj = obj->getNextObject()) {
 		if (obj->isEffectivelyDead()) continue;
@@ -219,21 +280,47 @@ void AILearningPlayer::countForces(Real* infantry, Real* vehicles, Real* aircraf
 		Bool isOwn = (obj->getControllingPlayer() == m_player);
 		if (isOwn != own) continue;
 
+		// Calculate health ratio for this unit
+		Real healthRatio = 1.0f;
+		const BodyModuleInterface* body = obj->getBodyModule();
+		if (body) {
+			Real maxHealth = body->getMaxHealth();
+			if (maxHealth > 0) {
+				healthRatio = body->getHealth() / maxHealth;
+			}
+		}
+
 		if (obj->isKindOf(KINDOF_INFANTRY)) {
 			infantryCount++;
+			infantryHealth += healthRatio;
 		} else if (obj->isKindOf(KINDOF_VEHICLE)) {
 			vehicleCount++;
+			vehicleHealth += healthRatio;
 		} else if (obj->isKindOf(KINDOF_AIRCRAFT)) {
 			aircraftCount++;
+			aircraftHealth += healthRatio;
 		} else if (obj->isKindOf(KINDOF_STRUCTURE)) {
 			structureCount++;
+			structureHealth += healthRatio;
 		}
 	}
 
+	// [0] = log10(count+1) for scale-invariant count
 	infantry[0] = (Real)log10((double)(infantryCount + 1));
 	vehicles[0] = (Real)log10((double)(vehicleCount + 1));
 	aircraft[0] = (Real)log10((double)(aircraftCount + 1));
 	structures[0] = (Real)log10((double)(structureCount + 1));
+
+	// [1] = average health ratio (0-1)
+	infantry[1] = (infantryCount > 0) ? (infantryHealth / infantryCount) : 0.0f;
+	vehicles[1] = (vehicleCount > 0) ? (vehicleHealth / vehicleCount) : 0.0f;
+	aircraft[1] = (aircraftCount > 0) ? (aircraftHealth / aircraftCount) : 0.0f;
+	structures[1] = (structureCount > 0) ? (structureHealth / structureCount) : 0.0f;
+
+	// [2] = production queue count (only for own units)
+	// Note: Production tracking would require accessing production queue data
+	// which isn't easily accessible here. Leave as 0 for now - can be enhanced later
+	// when we have access to the production system's queue state.
 }
 
 Real AILearningPlayer::calculateTechLevel()
@@ -388,9 +475,10 @@ Real AILearningPlayer::calculateUnderAttack()
 	// This is approximated by checking base threat level
 	Real threat = calculateBaseThreat();
 
-	// Also check if we've taken damage recently (within 5 seconds)
+	// Also check if we've taken damage recently (within 10 seconds)
+	// Increased from 5 seconds to catch faster attack patterns
 	UnsignedInt currentFrame = TheGameLogic->getFrame();
-	UnsignedInt recentWindow = 5 * LOGICFRAMES_PER_SECOND;
+	UnsignedInt recentWindow = 10 * LOGICFRAMES_PER_SECOND;
 
 	Bool recentlyDamaged = (currentFrame - m_lastDamageFrame) < recentWindow;
 
@@ -525,11 +613,7 @@ Bool AILearningPlayer::shouldDelayBuilding(BuildingCategory category)
 // ATTACK TIMING
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
-Bool AILearningPlayer::shouldHoldTeam()
-{
-	if (!m_currentRecommendation.valid) return false;
-	return (m_currentRecommendation.aggression < MLConfig::AGGRESSION_DEFENSIVE_THRESHOLD);
-}
+// NOTE: shouldHoldTeam() removed as dead code - attack timing handled by checkReadyTeams()
 
 Int AILearningPlayer::getMinArmySizeForAttack()
 {
@@ -784,6 +868,363 @@ void AILearningPlayer::checkReadyTeams()
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
+// HIERARCHICAL CONTROL - Tactical Layer
+///////////////////////////////////////////////////////////////////////////////////////////////////
+
+Bool AILearningPlayer::getBasePosition(Coord3D& outPos)
+{
+	// Return cached position if valid
+	if (m_hasValidBasePos) {
+		outPos = m_cachedBasePos;
+		return true;
+	}
+
+	// Find command center
+	for (Object* obj = TheGameLogic->getFirstObject(); obj; obj = obj->getNextObject()) {
+		if (obj->getControllingPlayer() != m_player) continue;
+		if (obj->isKindOf(KINDOF_COMMANDCENTER) && !obj->isEffectivelyDead()) {
+			const Coord3D* pos = obj->getPosition();
+			if (pos) {
+				m_cachedBasePos = *pos;
+				m_hasValidBasePos = true;
+				outPos = m_cachedBasePos;
+				return true;
+			}
+		}
+	}
+
+	return false;
+}
+
+Bool AILearningPlayer::teamNeedsTacticalUpdate(Team* team)
+{
+	if (!team) return false;
+
+	TeamID teamId = team->getID();
+	if (teamId >= MAX_TRACKED_TEAMS) return false;
+
+	UnsignedInt lastFrame = m_lastTacticalFrame[teamId];
+	UnsignedInt currentFrame = TheGameLogic->getFrame();
+
+	return (currentFrame - lastFrame) >= m_tacticalDecisionInterval;
+}
+
+void AILearningPlayer::processTeamTactics()
+{
+	// Early exit if no batched mode or no recommendation
+	if (!m_mlBridge.hasBatchedResponse()) return;
+
+	const MLBatchedResponse& response = m_mlBridge.getLastBatchedResponse();
+
+	// Process each team command in the response
+	for (Int i = 0; i < response.numTeamCommands; i++) {
+		const TacticalCommand& cmd = response.teamCommands[i];
+		if (!cmd.valid) continue;
+
+		// Find the team by ID
+		Team* team = TheTeamFactory->findTeamByID((TeamID)cmd.teamId);
+		if (!team) continue;
+
+		// Verify this team belongs to our player
+		if (team->getControllingPlayer() != m_player) continue;
+
+		// Execute the command
+		executeTacticalCommand(team, cmd);
+
+		// Update tracking
+		if (cmd.teamId < MAX_TRACKED_TEAMS) {
+			m_lastTacticalFrame[cmd.teamId] = TheGameLogic->getFrame();
+		}
+	}
+}
+
+void AILearningPlayer::buildTeamTacticalState(Team* team, TacticalState& outState)
+{
+	// Use the shared state builder
+	buildTacticalState(team, m_strategicOutput, m_player, outState);
+}
+
+void AILearningPlayer::executeTacticalCommand(Team* team, const TacticalCommand& cmd)
+{
+	if (!team) return;
+
+	// Get team as AIGroup for issuing commands
+	AIGroup* group = TheAI->createGroup();
+	if (!group) return;
+
+	team->getTeamAsAIGroup(group);
+
+	// Calculate world position from normalized coordinates
+	// Assuming map is approximately 3000x3000 units
+	const Real mapScale = 3000.0f;
+	Coord3D targetPos;
+	targetPos.x = cmd.targetX * mapScale;
+	targetPos.y = cmd.targetY * mapScale;
+	targetPos.z = 0;
+
+	ML_LOG(("TacticalCmd: team=%d action=%d pos=(%.1f,%.1f) attitude=%.2f\n",
+		cmd.teamId, cmd.action, targetPos.x, targetPos.y, cmd.attitude));
+
+	switch (cmd.action) {
+		case TACTICAL_ATTACK_MOVE:
+			group->groupAttackMoveToPosition(&targetPos, INT_MAX, CMD_FROM_AI);
+			break;
+
+		case TACTICAL_ATTACK_TARGET:
+			// Find nearest enemy at target position to attack
+			group->groupAttackMoveToPosition(&targetPos, INT_MAX, CMD_FROM_AI);
+			break;
+
+		case TACTICAL_DEFEND_POSITION:
+			group->groupGuardPosition(&targetPos, GUARDMODE_NORMAL, CMD_FROM_AI);
+			break;
+
+		case TACTICAL_RETREAT: {
+			Coord3D basePos;
+			if (getBasePosition(basePos)) {
+				group->groupMoveToPosition(&basePos, false, CMD_FROM_AI);
+			}
+			break;
+		}
+
+		case TACTICAL_HOLD:
+			group->groupIdle(CMD_FROM_AI);
+			break;
+
+		case TACTICAL_HUNT:
+			// Attack-move aggressively toward enemy
+			group->groupAttackMoveToPosition(&targetPos, INT_MAX, CMD_FROM_AI);
+			break;
+
+		case TACTICAL_REINFORCE:
+			// Move toward rally point
+			group->groupMoveToPosition(&targetPos, false, CMD_FROM_AI);
+			break;
+
+		case TACTICAL_SPECIAL:
+			// TODO: Implement special ability usage
+			break;
+
+		default:
+			break;
+	}
+
+	// Cleanup group
+	group->deleteInstance();
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
+// HIERARCHICAL CONTROL - Micro Layer
+///////////////////////////////////////////////////////////////////////////////////////////////////
+
+Bool AILearningPlayer::unitNeedsMicroUpdate(Object* unit)
+{
+	if (!unit) return false;
+
+	// Check if unit is in our tracking list
+	ObjectID unitId = unit->getID();
+	Int trackIdx = -1;
+
+	for (Int i = 0; i < m_trackedUnitCount; i++) {
+		if (m_trackedUnitIds[i] == unitId) {
+			trackIdx = i;
+			break;
+		}
+	}
+
+	if (trackIdx < 0) {
+		// Not tracked yet - add if space available and should be micro'd
+		if (!shouldMicroUnit(unit)) return false;
+		if (m_trackedUnitCount >= MAX_TRACKED_UNITS) return false;
+
+		trackIdx = m_trackedUnitCount++;
+		m_trackedUnitIds[trackIdx] = unitId;
+		m_lastMicroFrame[trackIdx] = 0;
+	}
+
+	UnsignedInt lastFrame = m_lastMicroFrame[trackIdx];
+	UnsignedInt currentFrame = TheGameLogic->getFrame();
+
+	return (currentFrame - lastFrame) >= m_microDecisionInterval;
+}
+
+void AILearningPlayer::processMicroControl()
+{
+	// Early exit if no batched mode or no recommendation
+	if (!m_mlBridge.hasBatchedResponse()) return;
+
+	const MLBatchedResponse& response = m_mlBridge.getLastBatchedResponse();
+
+	// Process each unit command in the response
+	for (Int i = 0; i < response.numUnitCommands; i++) {
+		const MicroCommand& cmd = response.unitCommands[i];
+		if (!cmd.valid) continue;
+
+		// Find the unit by ID
+		Object* unit = TheGameLogic->findObjectByID(cmd.unitId);
+		if (!unit || unit->isEffectivelyDead()) continue;
+
+		// Verify this unit belongs to our player
+		if (unit->getControllingPlayer() != m_player) continue;
+
+		// Execute the command
+		executeMicroCommand(unit, cmd);
+
+		// Update tracking
+		for (Int j = 0; j < m_trackedUnitCount; j++) {
+			if (m_trackedUnitIds[j] == cmd.unitId) {
+				m_lastMicroFrame[j] = TheGameLogic->getFrame();
+				break;
+			}
+		}
+	}
+
+	// Cleanup stale tracked units
+	Int writeIdx = 0;
+	UnsignedInt currentFrame = TheGameLogic->getFrame();
+	for (Int i = 0; i < m_trackedUnitCount; i++) {
+		// Remove units not updated in 10 seconds
+		if (currentFrame - m_lastMicroFrame[i] < 300) {
+			if (writeIdx != i) {
+				m_trackedUnitIds[writeIdx] = m_trackedUnitIds[i];
+				m_lastMicroFrame[writeIdx] = m_lastMicroFrame[i];
+			}
+			writeIdx++;
+		}
+	}
+	m_trackedUnitCount = writeIdx;
+}
+
+void AILearningPlayer::buildUnitMicroState(Object* unit, MicroState& outState)
+{
+	// Build team objective context (simplified - just pass direction to objective)
+	Real teamObjective[4] = { 0, 0, 0, 0.5f };  // Default values
+
+	// Try to get team objective from unit's team
+	Team* team = unit->getTeam();
+	if (team) {
+		const Coord3D* teamPos = team->getEstimateTeamPosition();
+		const Coord3D* unitPos = unit->getPosition();
+		if (teamPos && unitPos) {
+			// Direction to team center
+			Real dx = teamPos->x - unitPos->x;
+			Real dy = teamPos->y - unitPos->y;
+			Real dist = sqrtf(dx * dx + dy * dy);
+			if (dist > 0.001f) {
+				teamObjective[1] = atan2f(dy, dx) / 3.14159265f;  // Normalized angle
+			}
+		}
+	}
+
+	buildMicroState(unit, teamObjective, outState);
+}
+
+void AILearningPlayer::executeMicroCommand(Object* unit, const MicroCommand& cmd)
+{
+	if (!unit) return;
+
+	AIUpdateInterface* ai = unit->getAIUpdateInterface();
+	if (!ai) return;
+
+	const Coord3D* unitPos = unit->getPosition();
+	if (!unitPos) return;
+
+	ML_LOG(("MicroCmd: unit=%d action=%d angle=%.2f dist=%.2f\n",
+		cmd.unitId, cmd.action, cmd.moveAngle, cmd.moveDistance));
+
+	switch (cmd.action) {
+		case MICRO_ATTACK_CURRENT:
+			// Continue current target - no action needed
+			break;
+
+		case MICRO_ATTACK_NEAREST: {
+			Real dist, angle;
+			Object* target = findNearestEnemy(unit, &dist, &angle);
+			if (target) {
+				ai->aiAttackObject(target, false, CMD_FROM_AI);
+			}
+			break;
+		}
+
+		case MICRO_ATTACK_WEAKEST: {
+			Object* target = findWeakestEnemy(unit, MicroConfig::COMBAT_DETECTION_RADIUS);
+			if (target) {
+				ai->aiAttackObject(target, false, CMD_FROM_AI);
+			}
+			break;
+		}
+
+		case MICRO_ATTACK_PRIORITY: {
+			Object* target = findPriorityTarget(unit, MicroConfig::COMBAT_DETECTION_RADIUS);
+			if (target) {
+				ai->aiAttackObject(target, false, CMD_FROM_AI);
+			}
+			break;
+		}
+
+		case MICRO_MOVE_FORWARD: {
+			// Move in specified direction
+			Coord3D movePos;
+			Real moveDist = cmd.moveDistance * 100.0f;  // Scale to game units
+			movePos.x = unitPos->x + cosf(cmd.moveAngle) * moveDist;
+			movePos.y = unitPos->y + sinf(cmd.moveAngle) * moveDist;
+			movePos.z = unitPos->z;
+			ai->aiMoveToPosition(&movePos, CMD_FROM_AI);
+			break;
+		}
+
+		case MICRO_MOVE_BACKWARD: {
+			// Kite - find nearest enemy and move away
+			Real enemyDist, enemyAngle;
+			Object* enemy = findNearestEnemy(unit, &enemyDist, &enemyAngle);
+			if (enemy) {
+				const Coord3D* enemyPos = enemy->getPosition();
+				Coord3D kitePos;
+				calculateKitePosition(unit, enemyPos, &kitePos);
+				ai->aiMoveToPosition(&kitePos, CMD_FROM_AI);
+			}
+			break;
+		}
+
+		case MICRO_MOVE_FLANK: {
+			// Circle strafe around nearest enemy
+			Real enemyDist, enemyAngle;
+			Object* enemy = findNearestEnemy(unit, &enemyDist, &enemyAngle);
+			if (enemy) {
+				const Coord3D* enemyPos = enemy->getPosition();
+				Coord3D flankPos;
+				calculateFlankPosition(unit, enemyPos, cmd.moveAngle > 0, &flankPos);
+				ai->aiMoveToPosition(&flankPos, CMD_FROM_AI);
+			}
+			break;
+		}
+
+		case MICRO_HOLD_FIRE:
+			ai->aiIdle(CMD_FROM_AI);
+			break;
+
+		case MICRO_USE_ABILITY:
+			// TODO: Implement ability usage
+			break;
+
+		case MICRO_RETREAT: {
+			Coord3D basePos;
+			if (getBasePosition(basePos)) {
+				ai->aiMoveToPosition(&basePos, CMD_FROM_AI);
+			}
+			break;
+		}
+
+		case MICRO_FOLLOW_TEAM:
+			// Default team behavior - no explicit command needed
+			break;
+
+		default:
+			break;
+	}
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
 // GAME END DETECTION
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -810,50 +1251,62 @@ void AILearningPlayer::checkGameEnd()
 	UnsignedInt currentFrame = TheGameLogic->getFrame();
 	if (currentFrame < MIN_GAME_FRAMES) return;
 
+	// FIX: Determine game end result first, then set flag before sending
+	// This prevents potential re-entry issues
+	Bool gameEnded = false;
+	Bool victory = false;
+	Real gameTime = (Real)currentFrame / (30.0f * 60.0f);
+	Real armyStrength = 0.0f;
+	const char* endReason = "";
+
 	// Check if WE have lost (no CC and no dozer)
 	if (!playerHasKeyUnits(m_player)) {
-		Real gameTime = (Real)currentFrame / (30.0f * 60.0f);
-		m_mlBridge.sendGameEnd(false, gameTime, 0.0f);
-		m_gameEndSent = true;
-		ML_LOG(("Defeat: No CC or dozer at frame %d\n", currentFrame));
-		return;
+		gameEnded = true;
+		victory = false;
+		armyStrength = 0.0f;
+		endReason = "Defeat: No CC or dozer";
 	}
+	else {
+		// Check if ALL enemies are defeated (must check every enemy player)
+		Int enemyCount = 0;
+		Int aliveEnemyCount = 0;
 
-	// Check if ALL enemies are defeated (must check every enemy player)
-	Int enemyCount = 0;
-	Int aliveEnemyCount = 0;
+		for (Int i = 0; i < MAX_PLAYER_COUNT; i++) {
+			Player* otherPlayer = ThePlayerList->getNthPlayer(i);
+			if (!otherPlayer || otherPlayer == m_player) continue;
+			if (m_player->getRelationship(otherPlayer->getDefaultTeam()) != ENEMIES) continue;
 
-	for (Int i = 0; i < MAX_PLAYER_COUNT; i++) {
-		Player* otherPlayer = ThePlayerList->getNthPlayer(i);
-		if (!otherPlayer || otherPlayer == m_player) continue;
-		if (m_player->getRelationship(otherPlayer->getDefaultTeam()) != ENEMIES) continue;
+			enemyCount++;
+			if (playerHasKeyUnits(otherPlayer)) {
+				aliveEnemyCount++;
+			}
+		}
 
-		enemyCount++;
-		if (playerHasKeyUnits(otherPlayer)) {
-			aliveEnemyCount++;
+		// Victory only if we found enemies AND all are defeated
+		if (enemyCount > 0 && aliveEnemyCount == 0) {
+			gameEnded = true;
+			victory = true;
+			armyStrength = calculateArmyStrength();
+			endReason = "Victory: All enemies defeated";
+		}
+		// Game timeout handling (optional: end as draw after 60 minutes)
+		else {
+			const UnsignedInt MAX_GAME_FRAMES = 60 * 60 * LOGICFRAMES_PER_SECOND;  // 60 minutes
+			if (currentFrame >= MAX_GAME_FRAMES) {
+				gameEnded = true;
+				armyStrength = calculateArmyStrength();
+				victory = (armyStrength > 1.0f);
+				endReason = "Timeout";
+			}
 		}
 	}
 
-	// Victory only if we found enemies AND all are defeated
-	if (enemyCount > 0 && aliveEnemyCount == 0) {
-		Real gameTime = (Real)currentFrame / (30.0f * 60.0f);
-		m_mlBridge.sendGameEnd(true, gameTime, calculateArmyStrength());
+	// Send game end if detected
+	if (gameEnded) {
+		// Set flag BEFORE sending to prevent any re-entry
 		m_gameEndSent = true;
-		ML_LOG(("Victory: All %d enemies defeated at frame %d\n", enemyCount, currentFrame));
-		return;
-	}
-
-	// Game timeout handling (optional: end as draw after 60 minutes)
-	const UnsignedInt MAX_GAME_FRAMES = 60 * 60 * LOGICFRAMES_PER_SECOND;  // 60 minutes
-	if (currentFrame >= MAX_GAME_FRAMES) {
-		Real gameTime = (Real)currentFrame / (30.0f * 60.0f);
-		Real armyStrength = calculateArmyStrength();
-		// Declare winner based on army strength
-		Bool victory = (armyStrength > 1.0f);
 		m_mlBridge.sendGameEnd(victory, gameTime, armyStrength);
-		m_gameEndSent = true;
-		ML_LOG(("Timeout: Game ended at frame %d, army ratio %.2f -> %s\n",
-			currentFrame, armyStrength, victory ? "Victory" : "Defeat"));
+		ML_LOG(("%s at frame %d, army ratio %.2f\n", endReason, currentFrame, armyStrength));
 	}
 }
 

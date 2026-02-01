@@ -13,6 +13,7 @@ from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass
 
 from .model import PolicyNetwork, STATE_DIM, TOTAL_ACTION_DIM
+from .config import ENTROPY_DECAY, ENTROPY_MIN
 
 
 @dataclass
@@ -26,6 +27,8 @@ class PPOConfig:
     clip_epsilon: float = 0.2
     clip_value: float = 0.2
     entropy_coef: float = 0.01
+    entropy_coef_min: float = ENTROPY_MIN       # Minimum entropy coefficient
+    entropy_decay: float = ENTROPY_DECAY         # Decay rate per update
     value_coef: float = 0.5
     max_grad_norm: float = 0.5
 
@@ -84,6 +87,10 @@ class RolloutBuffer:
         dones = torch.tensor(self.dones, dtype=torch.float32)
 
         # GAE computation
+        # Semantic note: dones[t]=True means the transition FROM state t ends the episode.
+        # Therefore, when computing advantage for step t using values[t+1], we mask with
+        # dones[t] because if dones[t]=True, the state t+1 value should be 0 (terminal).
+        # This is the CORRECT semantic for masking next_value with dones[t].
         last_gae = 0
         for t in reversed(range(n)):
             if t == n - 1:
@@ -163,6 +170,9 @@ class PPOAgent:
 
         # Rollout buffer
         self.buffer = RolloutBuffer()
+
+        # Entropy coefficient with decay
+        self.current_entropy_coef = self.config.entropy_coef
 
         # Training statistics
         self.total_steps = 0
@@ -262,11 +272,11 @@ class PPOAgent:
                 # Entropy bonus
                 entropy_loss = -entropy.mean()
 
-                # Total loss
+                # Total loss (using current entropy coefficient with decay)
                 loss = (
                     policy_loss +
                     self.config.value_coef * value_loss +
-                    self.config.entropy_coef * entropy_loss
+                    self.current_entropy_coef * entropy_loss
                 )
 
                 # Optimize
@@ -297,6 +307,13 @@ class PPOAgent:
         self.scheduler.step()
         stats['learning_rate'] = self.scheduler.get_last_lr()[0]
 
+        # Entropy coefficient decay
+        self.current_entropy_coef = max(
+            self.config.entropy_coef_min,
+            self.current_entropy_coef * self.config.entropy_decay
+        )
+        stats['entropy_coef'] = self.current_entropy_coef
+
         # Clear buffer
         self.buffer.clear()
         self.update_count += 1
@@ -313,6 +330,7 @@ class PPOAgent:
             'total_steps': self.total_steps,
             'total_episodes': self.total_episodes,
             'update_count': self.update_count,
+            'current_entropy_coef': self.current_entropy_coef,
         }, path)
 
     def load(self, path: str):
@@ -325,6 +343,7 @@ class PPOAgent:
         self.total_steps = checkpoint.get('total_steps', 0)
         self.total_episodes = checkpoint.get('total_episodes', 0)
         self.update_count = checkpoint.get('update_count', 0)
+        self.current_entropy_coef = checkpoint.get('current_entropy_coef', self.config.entropy_coef)
 
 
 if __name__ == '__main__':

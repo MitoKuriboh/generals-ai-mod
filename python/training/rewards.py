@@ -23,14 +23,16 @@ Usage:
 from typing import Dict, Optional, Any
 from dataclasses import dataclass
 
+from training.config import WIN_REWARD, LOSS_REWARD, DRAW_REWARD
+
 
 @dataclass
 class RewardConfig:
     """Configuration for reward calculation."""
-    # Terminal rewards (increased 10x for better learning signal)
-    win_reward: float = 100.0
-    loss_reward: float = -100.0
-    draw_reward: float = 0.0
+    # Terminal rewards (from config.py - single source of truth)
+    win_reward: float = WIN_REWARD
+    loss_reward: float = LOSS_REWARD
+    draw_reward: float = DRAW_REWARD
 
     # Combat rewards (increased 25x for meaningful feedback)
     enemy_unit_killed: float = 0.5
@@ -165,15 +167,22 @@ def calculate_reward(
 
 def _calculate_terminal_reward(state: Dict, config: RewardConfig) -> float:
     """Calculate terminal reward (win/loss/draw)."""
+    # FIX: Lowered threshold from 0.3 to 0.1 (log10(1+1)=0.3 means 1 building,
+    # log10(0+1)=0 means 0 buildings). Threshold 0.1 means truly no buildings.
+    STRUCTURE_THRESHOLD = 0.1
+
     # Check for loss (no structures)
     own_structures = state.get('own_structures', [0, 0, 0])
-    if own_structures[0] < 0.3:  # Less than 1 structure
+    if own_structures[0] < STRUCTURE_THRESHOLD:
         return config.loss_reward
 
     # Check for win (enemy eliminated)
+    # FIX: Added check that WE still have structures (mutual destruction != victory)
     enemy_structures = state.get('enemy_structures', [0, 0, 0])
     game_time = state.get('game_time', 0)
-    if enemy_structures[0] < 0.3 and game_time > 5.0:
+    if (enemy_structures[0] < STRUCTURE_THRESHOLD and
+        own_structures[0] >= STRUCTURE_THRESHOLD and
+        game_time > 5.0):
         return config.win_reward
 
     # Timeout draw
@@ -248,10 +257,16 @@ def _calculate_economy_reward(
     reward += income_advantage * config.income_bonus
 
     # Wealth accumulation (only if gaining)
+    # Money is log10(dollars+1) from C++ (see MLBridge stateToJson).
+    # Convert back to dollars: dollars = 10^money - 1
+    # Note: model.py divides by 5 for NN input normalization, but we use raw state dict here
     current_money = current_state.get('money', 0)
     prev_money = prev_state.get('money', 0)
     if current_money > prev_money:
-        money_gained = (10 ** current_money - 10 ** prev_money)  # Convert from log scale
+        # Calculate dollar difference from log-scale values
+        current_dollars = 10 ** current_money - 1
+        prev_dollars = 10 ** prev_money - 1
+        money_gained = max(0, current_dollars - prev_dollars)
         reward += (money_gained / 100) * config.money_bonus
 
     return reward
@@ -271,7 +286,8 @@ def _calculate_strategic_reward(
 
     strength_change = current_strength - prev_strength
     if strength_change > 0:
-        reward += strength_change * config.army_strength_bonus * 10
+        # FIX: Removed hidden 10x multiplier that was dominating other signals
+        reward += strength_change * config.army_strength_bonus
 
     # Bonus for having army advantage
     if current_strength > 1.0:
@@ -281,7 +297,8 @@ def _calculate_strategic_reward(
     current_tech = current_state.get('tech_level', 0)
     prev_tech = prev_state.get('tech_level', 0)
     if current_tech > prev_tech:
-        reward += (current_tech - prev_tech) * config.tech_advancement * 10
+        # FIX: Removed hidden 10x multiplier that was dominating other signals
+        reward += (current_tech - prev_tech) * config.tech_advancement
 
     return reward
 

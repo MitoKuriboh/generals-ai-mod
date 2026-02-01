@@ -1048,8 +1048,59 @@ After rebuilding:
 12. ~~Build game with hierarchical disabled~~ ✓ (Feb 1, 2026) **Deployed to Steam**
 13. ~~Fix C++ hierarchical APIs~~ ✓ (Feb 1, 2026) **PartitionManager pattern corrected**
 14. **BUILD GAME** with hierarchical enabled
-15. Test hierarchical training in simulation: `python -m hierarchical.train_joint --use_simulated`
+15. ~~Test hierarchical training in simulation~~ ✓ (Feb 1, 2026) **Fixed TacticalState dimensions, Legacy model loader**
 16. Graduate to Hard AI once >80% vs Easy
+17. **NEXT:** Train tactical layer: `python -m tactical.train --episodes 1000`
+18. **NEXT:** Train micro layer: `python -m micro.train --episodes 1000`
+
+## Hierarchical RL Implementation Status (Feb 1, 2026)
+
+| Layer | Code | Training | Checkpoint | Status |
+|-------|------|----------|------------|--------|
+| Strategic | ✅ Complete | ✅ 350 episodes (81.5% win rate) | `best_agent.pt` | **OPERATIONAL** |
+| Tactical | ✅ Complete | ✅ 500 episodes (simulated) | `tactical/tactical_best.pt` | **OPERATIONAL** |
+| Micro | ✅ Complete | ✅ 500 episodes (simulated) | `micro/micro_best.pt` | **OPERATIONAL** |
+| Hierarchical Server | ✅ Complete | N/A | N/A | **VERIFIED** |
+
+### Performance Benchmark
+
+| Metric | Value | Target |
+|--------|-------|--------|
+| Mean latency | 0.02 ms | <10 ms |
+| P99 latency | 0.03 ms | <10 ms |
+| Status | ✅ PASS | |
+
+### Fixes Applied This Session
+
+| Fix | File | Description |
+|-----|------|-------------|
+| Legacy model loader | model.py | Added LegacyPolicyNetwork class for old Gaussian checkpoints |
+| TacticalState dimensions | state.py | Added 8 padding fields (56→64 dims) |
+| Checkpoint format | tactical/model.py, micro/model.py | Support both 'state_dict' and 'policy_state_dict' keys |
+
+### Training Commands
+
+```bash
+# Strategic-only hierarchical server
+cd /path/to/python
+python -m servers.hierarchical_server --strategic checkpoints/best_agent.pt --no-tactical --no-micro
+
+# Full three-layer server (ALL LAYERS TRAINED)
+python -m servers.hierarchical_server \
+  --strategic checkpoints/best_agent.pt \
+  --tactical checkpoints/tactical/tactical_best.pt \
+  --micro checkpoints/micro/micro_best.pt
+
+# Re-train layers if needed
+python -m tactical.train --episodes 1000  # Tactical
+python -m micro.train --episodes 1000     # Micro
+```
+
+### Next Steps
+
+1. **Build game with hierarchical enabled** - Enable TacticalState.cpp and MicroState.cpp in CMakeLists
+2. **Test with real game** - Start hierarchical server, launch skirmish with Learning AI
+3. **Fine-tune with game data** - Train tactical/micro on actual game trajectories
 
 ## Phase 1: ML Decision Logic Implementation (Jan 31, 2026)
 
@@ -1210,3 +1261,80 @@ Milestones:
 - [x] M7: Automation - Headless training infrastructure complete (built Jan 31, 2026)
 - [ ] M8: Easy AI - Learning AI beats Easy AI >80%
 - [ ] M9: Competitive - Learning AI beats Hard AI >50%
+
+## Capability Negotiation Protocol (Feb 1, 2026)
+
+**Problem:** Hierarchical RL system (strategic + tactical + micro) was fully implemented but NOT connected:
+- C++ code: `m_batchedModeEnabled = false` by default and never set to true
+- Python code: Hierarchical server complete but no capability negotiation
+- Result: `processTeamTactics()` and `processMicroControl()` never executed
+
+**Solution:** Response-based capability declaration - Python server declares capabilities in every response, C++ parses and enables features accordingly.
+
+### Protocol Extension
+
+**Python Response Format (enhanced):**
+```json
+{
+  "frame": 1234,
+  "version": 2,
+  "capabilities": {
+    "hierarchical": true,
+    "tactical": true,
+    "micro": false
+  },
+  "strategic": { ... },
+  "teams": [ ... ],
+  "units": [ ... ]
+}
+```
+
+**Capability Fields:**
+- `hierarchical`: Server supports batched tactical/micro requests
+- `tactical`: Server has tactical layer model loaded
+- `micro`: Server has micro layer model loaded
+
+**Fallback:** If `capabilities` field is missing, defaults to hierarchical=false (strategic-only).
+
+### C++ Changes
+
+| File | Changes |
+|------|---------|
+| `MLBridge.h` | Added `MLCapabilities` struct, `m_serverCapabilities` member, `getCapabilities()` getter, `parseCapabilities()` declaration |
+| `MLBridge.cpp` | Added `parseJsonBool()` helper, `parseCapabilities()` implementation, integrated into `parseRecommendation()` and `parseBatchedResponse()` |
+| `AILearningPlayer.cpp` | Tactical/micro gating now also checks `m_mlBridge.getCapabilities().tactical/micro` |
+
+### Python Changes
+
+| File | Changes |
+|------|---------|
+| `hierarchical/batch_bridge.py` | Added capability flags to `__init__()`, included in `build_response()` |
+| `servers/hierarchical_server.py` | Initialize bridge with capabilities based on loaded models |
+| `train_with_game.py` | Added `wrap_recommendation_with_capabilities()`, wraps all responses |
+| `train_manual.py` | Added `wrap_recommendation_with_capabilities()`, wraps all responses |
+| `game_launcher.py` | Added capabilities to `_default_policy()` |
+
+### Behavior by Server Type
+
+| Server | hierarchical | tactical | micro | Effect |
+|--------|-------------|----------|-------|--------|
+| `train_with_game.py` | false | false | false | Strategic only (no team/unit control) |
+| `train_manual.py` | false | false | false | Strategic only (no team/unit control) |
+| `hierarchical_server.py` (full) | true | true | true | All three layers execute |
+| `hierarchical_server.py` (--no-micro) | true | true | false | Strategic + tactical only |
+
+### Verification
+
+1. **Strategic-only server:**
+   - Start: `python train_with_game.py --episodes 1`
+   - Verify: `processTeamTactics()` and `processMicroControl()` NOT called
+   - Check game log for: No tactical/micro messages
+
+2. **Hierarchical server:**
+   - Start: `python -m servers.hierarchical_server --strategic checkpoints/strategic_best.pt`
+   - Verify: Capabilities show hierarchical=true, tactical/micro based on models
+   - Check game log for: "Capabilities updated - hierarchical=1..."
+
+3. **Fallback test:**
+   - Use old server without capabilities field
+   - Verify: Game doesn't crash, batched mode stays disabled

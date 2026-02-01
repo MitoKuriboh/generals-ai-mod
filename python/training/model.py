@@ -38,28 +38,32 @@ def state_dict_to_tensor(state: Dict) -> torch.Tensor:
     features = []
 
     # Economy (4)
-    features.append(state.get('money', 0) / 5.0)  # Log-scaled money, normalize to ~[0,1]
-    features.append(state.get('power', 0) / 100.0)  # Normalize
-    features.append(state.get('income', 0) / 10.0)
-    features.append(state.get('supply', 0.5))
+    # FIX: Added clipping to prevent outliers from destabilizing training
+    features.append(np.clip(state.get('money', 0) / 5.0, 0.0, 2.0))  # Log-scaled money, clip outliers
+    features.append(np.clip(state.get('power', 0) / 100.0, -2.0, 2.0))  # Power can be negative
+    features.append(np.clip(state.get('income', 0) / 10.0, -1.0, 2.0))  # Income rate
+    features.append(np.clip(state.get('supply', 0.5), 0.0, 1.0))
 
     # Own forces (12) - 3 features per category
+    # Format: [log10(count+1), avg_health_ratio (0-1), production_queue_count]
+    # health_ratio indicates army condition, useful for retreat/reinforce decisions
     for key in ['own_infantry', 'own_vehicles', 'own_aircraft', 'own_structures']:
         arr = state.get(key, [0, 0, 0])
         features.extend(arr[:3] if len(arr) >= 3 else arr + [0] * (3 - len(arr)))
 
-    # Enemy forces (12)
+    # Enemy forces (12) - same format as own forces
     for key in ['enemy_infantry', 'enemy_vehicles', 'enemy_aircraft', 'enemy_structures']:
         arr = state.get(key, [0, 0, 0])
         features.extend(arr[:3] if len(arr) >= 3 else arr + [0] * (3 - len(arr)))
 
     # Strategic (8)
-    features.append(state.get('game_time', 0) / 30.0)  # Normalize to ~1 at 30 min
-    features.append(state.get('tech_level', 0))
-    features.append(state.get('base_threat', 0))
-    features.append(state.get('army_strength', 1.0) / 2.0)  # Normalize
-    features.append(state.get('under_attack', 0))
-    features.append(state.get('distance_to_enemy', 0.5))
+    # FIX: Added clipping to prevent outliers
+    features.append(np.clip(state.get('game_time', 0) / 30.0, 0.0, 3.0))  # Clip at 90 min
+    features.append(np.clip(state.get('tech_level', 0), 0.0, 1.0))
+    features.append(np.clip(state.get('base_threat', 0), 0.0, 1.0))
+    features.append(np.clip(state.get('army_strength', 1.0) / 2.0, 0.0, 2.0))  # Clip at 4x advantage
+    features.append(np.clip(state.get('under_attack', 0), 0.0, 1.0))
+    features.append(np.clip(state.get('distance_to_enemy', 0.5), 0.0, 1.0))
 
     # Faction one-hot (3)
     features.append(state.get('is_usa', 0))
@@ -101,6 +105,82 @@ def action_tensor_to_dict(action: torch.Tensor) -> Dict:
         'aggression': float(np.clip(a[7], 0.0, 1.0)),
         'target_player': -1
     }
+
+
+class LegacyPolicyNetwork(nn.Module):
+    """
+    Legacy model architecture for loading old checkpoints.
+    Uses Gaussian distribution and 128 hidden units.
+    """
+
+    def __init__(self, state_dim: int = STATE_DIM, action_dim: int = TOTAL_ACTION_DIM,
+                 hidden_dim: int = 128):
+        super().__init__()
+
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+
+        # Shared feature extractor (no LayerNorm in legacy)
+        self.shared = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+        )
+
+        # Actor head - Gaussian (legacy)
+        self.actor_mean = nn.Linear(hidden_dim, action_dim)
+        self.actor_log_std = nn.Parameter(torch.zeros(action_dim))
+
+        # Critic head
+        self.critic = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, 1)
+        )
+
+    def forward(self, state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        features = self.shared(state)
+        mean = torch.sigmoid(self.actor_mean(features))  # Bounded [0,1]
+        std = self.actor_log_std.exp().expand_as(mean)
+        value = self.critic(features)
+        return mean, std, value
+
+    def get_action(self, state: torch.Tensor, deterministic: bool = False
+                   ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if state.dim() == 1:
+            state = state.unsqueeze(0)
+
+        mean, std, value = self.forward(state)
+
+        if deterministic:
+            action = mean
+            log_prob = torch.zeros(state.size(0), device=state.device)
+        else:
+            dist = torch.distributions.Normal(mean, std)
+            action = dist.sample()
+            action = action.clamp(0.0, 1.0)
+            log_prob = dist.log_prob(action).sum(dim=-1)
+
+        return action.squeeze(0), log_prob.squeeze(0), value.squeeze(0)
+
+    def evaluate_actions(self, states: torch.Tensor, actions: torch.Tensor
+                         ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        mean, std, values = self.forward(states)
+        dist = torch.distributions.Normal(mean, std)
+        log_probs = dist.log_prob(actions.clamp(1e-6, 1-1e-6)).sum(dim=-1)
+        entropy = dist.entropy().sum(dim=-1)
+        return log_probs, values.squeeze(-1), entropy
+
+    @classmethod
+    def load(cls, path: str) -> 'LegacyPolicyNetwork':
+        checkpoint = torch.load(path, map_location='cpu', weights_only=False)
+        model = cls()
+        if 'policy_state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['policy_state_dict'])
+        elif 'state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['state_dict'])
+        return model
 
 
 class PolicyNetwork(nn.Module):
@@ -203,10 +283,15 @@ class PolicyNetwork(nn.Module):
         else:
             # Sample from Beta distribution - proper [0,1] bounded with correct log-probs
             dist = torch.distributions.Beta(alpha, beta)
-            action = dist.rsample()
-            # Clamp to avoid exact 0 or 1 which cause log-prob issues
-            action = action.clamp(1e-6, 1 - 1e-6)
-            log_prob = dist.log_prob(action).sum(dim=-1)
+            action_raw = dist.rsample()
+            # CRITICAL FIX: Compute log_prob on RAW sample before clamping
+            # Computing log_prob after clamping corrupts policy gradients by pushing
+            # towards clamped boundaries rather than true optimal actions
+            log_prob = dist.log_prob(action_raw).sum(dim=-1)
+            # Clamp log_prob to prevent -inf from extreme samples
+            log_prob = log_prob.clamp(min=-100.0)
+            # Clamp action for output only (wider range to reduce interference)
+            action = action_raw.clamp(1e-7, 1 - 1e-7)
 
         return action.squeeze(0), log_prob.squeeze(0), value.squeeze(0)
 
@@ -228,9 +313,13 @@ class PolicyNetwork(nn.Module):
 
         # Create Beta distribution and evaluate
         dist = torch.distributions.Beta(alpha, beta)
-        # Clamp actions to valid Beta range to avoid numerical issues
-        actions_clamped = actions.clamp(1e-6, 1 - 1e-6)
+        # CRITICAL FIX: Use wider clamp range to minimize log-prob distortion
+        # Actions stored in buffer were already clamped to [1e-7, 1-1e-7] during get_action
+        # Re-clamping here with same range ensures numerical stability without bias
+        actions_clamped = actions.clamp(1e-7, 1 - 1e-7)
         log_probs = dist.log_prob(actions_clamped).sum(dim=-1)
+        # Clamp log_probs to prevent -inf from corrupting gradients
+        log_probs = log_probs.clamp(min=-100.0)
         entropy = dist.entropy().sum(dim=-1)
 
         return log_probs, values.squeeze(-1), entropy
@@ -244,14 +333,33 @@ class PolicyNetwork(nn.Module):
         }, path)
 
     @classmethod
-    def load(cls, path: str) -> 'PolicyNetwork':
-        """Load model from file."""
+    def load(cls, path: str, allow_legacy: bool = True) -> 'PolicyNetwork':
+        """
+        Load model from file.
+
+        If the checkpoint is from a legacy architecture (Gaussian, 128 hidden),
+        returns a LegacyPolicyNetwork instead.
+        """
         checkpoint = torch.load(path, map_location='cpu', weights_only=False)
+
+        # Detect legacy checkpoint format
+        state_dict_key = 'policy_state_dict' if 'policy_state_dict' in checkpoint else 'state_dict'
+        if state_dict_key not in checkpoint:
+            raise KeyError(f"Checkpoint missing state_dict. Keys: {checkpoint.keys()}")
+
+        state_dict = checkpoint[state_dict_key]
+
+        # Legacy checkpoints have 'actor_log_std' and 'actor_mean' instead of 'actor_alpha'/'actor_beta'
+        is_legacy = 'actor_log_std' in state_dict or 'actor_mean.weight' in state_dict
+
+        if is_legacy and allow_legacy:
+            return LegacyPolicyNetwork.load(path)
+
         model = cls(
             state_dim=checkpoint.get('state_dim', STATE_DIM),
             action_dim=checkpoint.get('action_dim', TOTAL_ACTION_DIM)
         )
-        model.load_state_dict(checkpoint['state_dict'])
+        model.load_state_dict(state_dict)
         return model
 
 

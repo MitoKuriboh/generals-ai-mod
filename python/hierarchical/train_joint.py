@@ -1,0 +1,536 @@
+"""
+Joint Training for Hierarchical RL
+
+Fine-tunes all three layers together with low learning rate
+to improve coordination between layers.
+
+Training stages:
+1. Freeze strategic, train tactical with strategic rewards
+2. Freeze strategic+tactical, train micro with tactical rewards
+3. Unfreeze all, joint fine-tuning with low LR
+"""
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from pathlib import Path
+
+# Import layer modules
+import sys
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from training.model import PolicyNetwork
+from training.ppo import PPOAgent, PPOConfig
+from tactical.model import TacticalNetwork
+from tactical.train import TacticalPPOAgent, TacticalPPOConfig
+from micro.model import MicroNetwork
+from micro.train import MicroPPOAgent, MicroPPOConfig
+
+
+@dataclass
+class JointTrainingConfig:
+    """Configuration for joint training."""
+
+    # Learning rates (much lower for fine-tuning)
+    strategic_lr: float = 1e-5
+    tactical_lr: float = 5e-5
+    micro_lr: float = 1e-4
+
+    # Freeze settings
+    freeze_strategic: bool = False
+    freeze_tactical: bool = False
+    freeze_micro: bool = False
+
+    # Training params
+    gamma: float = 0.99
+    gae_lambda: float = 0.95
+    clip_epsilon: float = 0.1  # Tighter clipping for fine-tuning
+    entropy_coef: float = 0.005  # Lower entropy for exploitation
+
+    # Reward weighting
+    strategic_reward_weight: float = 1.0
+    tactical_reward_weight: float = 0.5
+    micro_reward_weight: float = 0.3
+
+    # Updates
+    num_epochs: int = 3
+    batch_size: int = 64
+
+
+class JointHierarchicalTrainer:
+    """
+    Trainer for joint fine-tuning of hierarchical RL layers.
+    """
+
+    def __init__(self,
+                 strategic_agent: PPOAgent,
+                 tactical_agent: TacticalPPOAgent,
+                 micro_agent: MicroPPOAgent,
+                 config: Optional[JointTrainingConfig] = None,
+                 device: str = 'cpu'):
+
+        self.config = config or JointTrainingConfig()
+        self.device = torch.device(device)
+
+        self.strategic = strategic_agent
+        self.tactical = tactical_agent
+        self.micro = micro_agent
+
+        # Override learning rates
+        if not self.config.freeze_strategic:
+            for param_group in self.strategic.optimizer.param_groups:
+                param_group['lr'] = self.config.strategic_lr
+
+        if not self.config.freeze_tactical:
+            for param_group in self.tactical.optimizer.param_groups:
+                param_group['lr'] = self.config.tactical_lr
+
+        if not self.config.freeze_micro:
+            for param_group in self.micro.optimizer.param_groups:
+                param_group['lr'] = self.config.micro_lr
+
+        # Override clip epsilon
+        self.strategic.config.clip_epsilon = self.config.clip_epsilon
+        self.tactical.config.clip_epsilon = self.config.clip_epsilon
+        self.micro.config.clip_epsilon = self.config.clip_epsilon
+
+        # Stats
+        self.update_count = 0
+        self.total_reward = 0.0
+
+    def collect_episode(self, env) -> Tuple[float, Dict]:
+        """
+        Collect an episode with all three layers.
+
+        Args:
+            env: Environment that supports hierarchical control
+                 (SimulatedHierarchicalEnv or real game env)
+
+        Returns:
+            (total_reward, info_dict)
+        """
+        strategic_state = env.reset()
+        strategic_tensor = self._state_to_tensor(strategic_state, 'strategic')
+
+        episode_reward = 0.0
+        done = False
+        step = 0
+        info = {}
+
+        # Get initial strategic action
+        if not self.config.freeze_strategic:
+            strategic_action, strategic_log_prob, strategic_value = \
+                self.strategic.select_action(strategic_tensor)
+        else:
+            with torch.no_grad():
+                strategic_action, _, _ = self.strategic.select_action(strategic_tensor)
+            strategic_log_prob = torch.tensor(0.0)
+            strategic_value = torch.tensor(0.0)
+
+        while not done:
+            step += 1
+
+            # Tactical decisions for each team
+            tactical_rewards = []
+            team_states = env.get_team_states()
+
+            for team_id, team_state in team_states.items():
+                # Skip empty teams
+                if team_state.get('empty'):
+                    continue
+
+                tactical_tensor = self._state_to_tensor(team_state, 'tactical')
+
+                if not self.config.freeze_tactical:
+                    tactical_action, tactical_log_prob, tactical_value = \
+                        self.tactical.select_action(tactical_tensor)
+                else:
+                    with torch.no_grad():
+                        tactical_action, _, _ = self.tactical.select_action(tactical_tensor)
+                    tactical_log_prob = torch.tensor(0.0)
+                    tactical_value = torch.tensor(0.0)
+
+                # Micro decisions for units in team
+                micro_rewards = []
+                unit_states = env.get_unit_states(team_id)
+
+                for unit_id, unit_state in unit_states.items():
+                    micro_tensor = self._state_to_tensor(unit_state, 'micro')
+
+                    if not self.config.freeze_micro:
+                        # Reset hidden state for LSTM
+                        self.micro.reset_hidden(1)
+                        micro_action, micro_log_prob, micro_value = \
+                            self.micro.select_action(micro_tensor)
+                    else:
+                        with torch.no_grad():
+                            self.micro.reset_hidden(1)
+                            micro_action, _, _ = self.micro.select_action(micro_tensor)
+                        micro_log_prob = torch.tensor(0.0)
+                        micro_value = torch.tensor(0.0)
+
+                    # Apply micro action
+                    micro_reward = env.apply_micro_action(unit_id, self._action_to_dict(micro_action, 'micro'))
+                    micro_rewards.append(micro_reward)
+
+                    if not self.config.freeze_micro and len(self.micro.buffer) < 2048:
+                        self.micro.store_transition(
+                            micro_tensor, micro_action, micro_reward,
+                            micro_value, micro_log_prob, done=False
+                        )
+
+                # Apply tactical action
+                tactical_reward = env.apply_tactical_action(
+                    team_id, self._action_to_dict(tactical_action, 'tactical')
+                )
+                tactical_reward += self.config.micro_reward_weight * np.mean(micro_rewards) if micro_rewards else 0
+                tactical_rewards.append(tactical_reward)
+
+                if not self.config.freeze_tactical and len(self.tactical.buffer) < 2048:
+                    self.tactical.store_transition(
+                        tactical_tensor, tactical_action, tactical_reward,
+                        tactical_value, tactical_log_prob, done=False
+                    )
+
+            # Step environment
+            next_strategic_state, strategic_reward, done, info = env.step()
+            strategic_reward += self.config.tactical_reward_weight * np.mean(tactical_rewards) if tactical_rewards else 0
+
+            next_strategic_tensor = self._state_to_tensor(next_strategic_state, 'strategic')
+            episode_reward += strategic_reward
+
+            if not self.config.freeze_strategic and len(self.strategic.buffer) < 2048:
+                self.strategic.store_transition(
+                    strategic_tensor, strategic_action, strategic_reward,
+                    strategic_value, strategic_log_prob, done
+                )
+
+            strategic_tensor = next_strategic_tensor
+
+            # Get new strategic action if continuing
+            if not done:
+                if not self.config.freeze_strategic:
+                    strategic_action, strategic_log_prob, strategic_value = \
+                        self.strategic.select_action(strategic_tensor)
+                else:
+                    with torch.no_grad():
+                        strategic_action, _, _ = self.strategic.select_action(strategic_tensor)
+                    strategic_log_prob = torch.tensor(0.0)
+                    strategic_value = torch.tensor(0.0)
+
+        self.total_reward += episode_reward
+        return episode_reward, info
+
+    def _action_to_dict(self, action, layer: str) -> Dict:
+        """Convert action to dict for environment."""
+        # If already a dict, just return it (agents return dicts)
+        if isinstance(action, dict):
+            return action
+
+        if layer == 'tactical':
+            if isinstance(action, torch.Tensor):
+                if action.dim() == 0:
+                    action_idx = action.item()
+                else:
+                    action_idx = action[0].item() if len(action) > 0 else 0
+            else:
+                action_idx = int(action)
+            return {
+                'action': int(action_idx) % 8,
+                'target_x': 0.5,
+                'target_y': 0.5,
+                'attitude': 0.5
+            }
+        elif layer == 'micro':
+            if isinstance(action, torch.Tensor):
+                if action.dim() == 0:
+                    action_idx = action.item()
+                else:
+                    action_idx = action[0].item() if len(action) > 0 else 0
+            else:
+                action_idx = int(action)
+            return {
+                'action': int(action_idx) % 11,
+                'move_angle': 0.0,
+                'move_distance': 0.3
+            }
+        return {}
+
+    def update(self) -> Dict[str, Dict]:
+        """
+        Perform PPO updates on all unfrozen layers.
+
+        Returns:
+            Dict of stats for each layer
+        """
+        stats = {}
+
+        # Get last values for GAE
+        with torch.no_grad():
+            _, _, strategic_last_value = self.strategic.select_action(
+                torch.zeros(44)  # Dummy state
+            )
+            _, _, tactical_last_value = self.tactical.select_action(
+                torch.zeros(64)
+            )
+            self.micro.reset_hidden(1)
+            _, _, micro_last_value = self.micro.select_action(
+                torch.zeros(32)
+            )
+
+        # Update layers
+        if not self.config.freeze_strategic and len(self.strategic.buffer) > 0:
+            stats['strategic'] = self.strategic.update(strategic_last_value)
+
+        if not self.config.freeze_tactical and len(self.tactical.buffer) > 0:
+            stats['tactical'] = self.tactical.update(tactical_last_value)
+
+        if not self.config.freeze_micro and len(self.micro.buffer) > 0:
+            stats['micro'] = self.micro.update(micro_last_value)
+
+        self.update_count += 1
+        return stats
+
+    def _state_to_tensor(self, state: Dict, layer: str) -> torch.Tensor:
+        """Convert state dict to tensor for specific layer."""
+        if layer == 'strategic':
+            from training.model import state_dict_to_tensor
+            return state_dict_to_tensor(state)
+        elif layer == 'tactical':
+            # Handle SimulatedHierarchicalEnv team state format
+            if 'strategy_embedding' in state:
+                # Direct dict from sim env - convert to 64-dim tensor
+                arr = []
+                # Strategy embedding (8)
+                arr.extend(state.get('strategy_embedding', [0.5] * 8))
+                # Team composition - infantry (3)
+                arr.extend([
+                    state.get('team_count', 5) / 10.0,
+                    state.get('team_health', 0.8),
+                    1.0,  # ready
+                ])
+                # Team composition - vehicles (3)
+                arr.extend([0.3, 0.8, 1.0])
+                # Team composition - aircraft (3)
+                arr.extend([0.0, 0.0, 0.0])
+                # Team composition - mixed (3)
+                arr.extend([0.0, 0.0, 0.0])
+                # Team status (8)
+                arr.extend([
+                    state.get('team_health', 0.8),
+                    1.0,  # ammo
+                    state.get('cohesion', 0.8),
+                    0.5,  # experience
+                    0.5,  # dist_to_objective
+                    0.3,  # dist_to_base
+                    state.get('under_fire', 0.0),
+                    0.0,  # has_transport
+                ])
+                # Situational (16)
+                arr.extend(state.get('nearby_enemies', [0.1, 0.1, 0.1, 0.1]))
+                arr.extend(state.get('nearby_allies', [0.2, 0.2, 0.2, 0.2]))
+                arr.extend([
+                    0.5,  # terrain_advantage
+                    0.3,  # threat_level
+                    0.5,  # target_value
+                    0.5,  # supply_dist
+                    1.0,  # retreat_path
+                    0.0,  # reinforce_possible
+                    0.0,  # special_ready
+                    0.0,  # padding
+                ])
+                # Objective (8)
+                arr.extend([
+                    state.get('objective_type', 0) / 8.0,
+                    state.get('objective_x', 0.5),
+                    state.get('objective_y', 0.5),
+                    0.5,  # priority
+                    0.0,  # progress
+                    0.0,  # time_on_objective
+                    0.0, 0.0,  # padding
+                ])
+                # Temporal (4)
+                arr.extend([0.5, 0.0, 0.5, 0.0])
+                # Ensure exactly 64 dimensions
+                while len(arr) < 64:
+                    arr.append(0.0)
+                return torch.tensor(arr[:64], dtype=torch.float32)
+            else:
+                from tactical.state import build_tactical_state
+                tac_state = build_tactical_state(state, 0)
+                return tac_state.to_tensor()
+        elif layer == 'micro':
+            # Handle SimulatedHierarchicalEnv unit state format
+            if 'nearest_enemy_dist' in state:
+                arr = [
+                    state.get('unit_type', 0.5),
+                    state.get('is_hero', 0.0),
+                    state.get('veterancy', 0.0),
+                    0.0,  # has_ability
+                    state.get('health', 1.0),
+                    0.0,  # shield
+                    1.0,  # ammunition
+                    0.0,  # cooldown
+                    0.5,  # speed
+                    0.5,  # range
+                    state.get('dps', 0.5),
+                    0.5,  # armor
+                    state.get('nearest_enemy_dist', 1.0),
+                    state.get('nearest_enemy_angle', 0.0),
+                    state.get('nearest_enemy_health', 0.0),
+                    0.3,  # enemy_threat
+                    0.5,  # nearest_ally_dist
+                    0.0,  # in_cover
+                    state.get('under_fire', 0.0),
+                    0.0,  # ability_ready
+                    state.get('nearest_enemy_dist', 1.0),  # target_dist
+                    state.get('nearest_enemy_health', 0.0),  # target_health
+                    0.5,  # target_type
+                    1.0,  # can_retreat
+                    state.get('objective_type', 0.0),
+                    state.get('objective_dir', 0.0),
+                    state.get('team_role', 0.5),
+                    state.get('priority', 0.5),
+                    0.5,  # time_since_hit
+                    0.0,  # time_since_shot
+                    0.5,  # time_in_combat
+                    0.0,  # movement_history
+                ]
+                return torch.tensor(arr[:32], dtype=torch.float32)
+            else:
+                from micro.state import build_micro_state
+                mic_state = build_micro_state(state)
+                return mic_state.to_tensor()
+        else:
+            raise ValueError(f"Unknown layer: {layer}")
+
+    def save(self, path_prefix: str):
+        """Save all models."""
+        self.strategic.save(f"{path_prefix}_strategic.pt")
+        self.tactical.save(f"{path_prefix}_tactical.pt")
+        self.micro.save(f"{path_prefix}_micro.pt")
+
+    def load(self, path_prefix: str):
+        """Load all models."""
+        self.strategic.load(f"{path_prefix}_strategic.pt")
+        self.tactical.load(f"{path_prefix}_tactical.pt")
+        self.micro.load(f"{path_prefix}_micro.pt")
+
+
+def train_joint(
+    strategic_checkpoint: str = None,
+    tactical_checkpoint: str = None,
+    micro_checkpoint: str = None,
+    num_episodes: int = 1000,
+    checkpoint_interval: int = 100,
+    output_dir: str = 'checkpoints/joint',
+    device: str = 'cpu',
+    use_simulated: bool = True,
+):
+    """
+    Joint fine-tuning of all three layers.
+
+    Args:
+        strategic_checkpoint: Path to strategic model (optional)
+        tactical_checkpoint: Path to tactical model (optional)
+        micro_checkpoint: Path to micro model (optional)
+        num_episodes: Number of training episodes
+        checkpoint_interval: Save checkpoint every N episodes
+        output_dir: Directory for checkpoints
+        device: Device to train on
+        use_simulated: Use SimulatedHierarchicalEnv instead of real game
+    """
+    from .sim_env import SimulatedHierarchicalEnv
+
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+
+    print("Initializing agents...")
+
+    # Initialize or load strategic
+    strategic_config = PPOConfig(lr=1e-5, clip_epsilon=0.1, entropy_coef=0.005)
+    strategic_agent = PPOAgent(strategic_config, device)
+    if strategic_checkpoint and Path(strategic_checkpoint).exists():
+        print(f"Loading strategic: {strategic_checkpoint}")
+        strategic_agent.load(strategic_checkpoint)
+
+    # Initialize or load tactical
+    tactical_config = TacticalPPOConfig(lr=5e-5, clip_epsilon=0.1, entropy_coef=0.005)
+    tactical_agent = TacticalPPOAgent(tactical_config, device)
+    if tactical_checkpoint and Path(tactical_checkpoint).exists():
+        print(f"Loading tactical: {tactical_checkpoint}")
+        tactical_agent.load(tactical_checkpoint)
+
+    # Initialize or load micro
+    micro_config = MicroPPOConfig(lr=1e-4, clip_epsilon=0.1, entropy_coef=0.005)
+    micro_agent = MicroPPOAgent(micro_config, device)
+    if micro_checkpoint and Path(micro_checkpoint).exists():
+        print(f"Loading micro: {micro_checkpoint}")
+        micro_agent.load(micro_checkpoint)
+
+    # Create joint trainer
+    config = JointTrainingConfig()
+    trainer = JointHierarchicalTrainer(
+        strategic_agent, tactical_agent, micro_agent, config, device
+    )
+
+    # Create environment
+    if use_simulated:
+        print("Using SimulatedHierarchicalEnv for training")
+        env = SimulatedHierarchicalEnv(num_teams=3, units_per_team=5, episode_length=200)
+    else:
+        raise NotImplementedError("Real game environment not yet implemented for joint training")
+
+    print(f"Starting joint training for {num_episodes} episodes...")
+
+    episode_rewards = []
+    wins = 0
+
+    for episode in range(num_episodes):
+        reward, info = trainer.collect_episode(env)
+        episode_rewards.append(reward)
+
+        if info.get('won'):
+            wins += 1
+
+        # Update all layers
+        if (episode + 1) % 10 == 0:
+            stats = trainer.update()
+
+        # Log progress
+        if (episode + 1) % 10 == 0:
+            recent_rewards = episode_rewards[-50:] if len(episode_rewards) >= 50 else episode_rewards
+            avg_reward = sum(recent_rewards) / len(recent_rewards)
+            win_rate = wins / (episode + 1) * 100
+            print(f"Episode {episode+1}/{num_episodes} | Reward: {reward:.2f} | "
+                  f"Avg: {avg_reward:.2f} | Win Rate: {win_rate:.1f}%")
+
+        # Save checkpoint
+        if (episode + 1) % checkpoint_interval == 0:
+            checkpoint_path = f"{output_dir}/joint_ep{episode+1}"
+            trainer.save(checkpoint_path)
+            print(f"Saved checkpoint: {checkpoint_path}")
+
+    # Save final models
+    trainer.save(f"{output_dir}/joint_final")
+    print(f"\nTraining complete. Final models saved to {output_dir}/joint_final")
+
+    return trainer
+
+
+if __name__ == '__main__':
+    print("Joint training module loaded.")
+    print("\nTo use joint training:")
+    print("1. Train strategic layer (already done, 81.5% win rate)")
+    print("2. Train tactical layer: python -m tactical.train")
+    print("3. Train micro layer: python -m micro.train")
+    print("4. Run joint training with trained checkpoints")
+    print("\nExample:")
+    print("  trainer = train_joint(")
+    print("      'checkpoints/strategic_best.pt',")
+    print("      'checkpoints/tactical_best.pt',")
+    print("      'checkpoints/micro_best.pt',")
+    print("      num_episodes=500")
+    print("  )")

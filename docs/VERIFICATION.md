@@ -211,3 +211,37 @@ State extraction is verified when:
 5. ✓ game_time increases linearly
 6. ✓ Strategic values respond to game events
 7. ✓ No obvious anomalies in analysis output
+
+---
+
+## Test Coverage
+
+Run the test suite with coverage:
+
+```bash
+cd /home/mito/generals-ai-mod
+python3 -m pytest --cov=python/training python/tests/ --cov-report=term
+```
+
+### Coverage Summary (2026-02-01)
+
+| Module | Stmts | Miss | Cover |
+|--------|-------|------|-------|
+| `__init__.py` | 7 | 0 | 100% |
+| `config.py` | 33 | 0 | 100% |
+| `model.py` | 127 | 31 | 76% |
+| `ppo.py` | 180 | 20 | 89% |
+| `rewards.py` | 180 | 116 | 36% |
+| `env.py` | 268 | 218 | 19% |
+| `metrics.py` | 187 | 159 | 15% |
+| `experiments.py` | 181 | 142 | 22% |
+| `train.py` | 190 | 190 | 0% |
+| **TOTAL** | **1353** | **876** | **35%** |
+
+### Notes
+
+- **Core modules** (`config`, `model`, `ppo`) have good coverage (76-100%)
+- **Reward logic** has 36% coverage; edge cases tested, complex game scenarios harder to mock
+- **env.py** low coverage expected - requires real game or extensive mocking
+- **train.py** 0% coverage - entry point tested via integration, not unit tests
+- **47 tests** pass consistently

@@ -42,8 +42,35 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from training.ppo import PPOAgent, PPOConfig
 from training.model import state_dict_to_tensor, action_tensor_to_dict, STATE_DIM
 from training.rewards import calculate_step_reward, RewardConfig
-from training.config import WIN_REWARD, LOSS_REWARD
+from training.config import WIN_REWARD, LOSS_REWARD, PROTOCOL_VERSION
 from game_launcher import GameLauncher, Episode
+
+
+def wrap_recommendation_with_capabilities(recommendation: Dict) -> Dict:
+    """
+    Wrap a strategic recommendation with capabilities declaration.
+
+    Strategic-only servers declare hierarchical=false so the game
+    doesn't try to use tactical/micro layers.
+    """
+    return {
+        'version': PROTOCOL_VERSION,
+        'capabilities': {
+            'hierarchical': False,
+            'tactical': False,
+            'micro': False,
+        },
+        **recommendation
+    }
+
+
+def validate_protocol_version(state: Dict) -> bool:
+    """Validate protocol version from game state. Returns True if valid."""
+    version = state.get('version', 1)
+    if version != PROTOCOL_VERSION:
+        print(f"[Warning] Protocol mismatch: expected {PROTOCOL_VERSION}, got {version}")
+        return False
+    return True
 
 
 @dataclass
@@ -252,6 +279,10 @@ class UnifiedTrainer:
                     time.sleep(0.1)
                     continue
 
+                # Validate protocol version on first state
+                if len(states) == 0:
+                    validate_protocol_version(state)
+
                 # Check for game end
                 if state.get('type') == 'game_end':
                     game_ended = True
@@ -284,8 +315,9 @@ class UnifiedTrainer:
                     done=False
                 )
 
-                # Send to game
-                self.launcher.send_recommendation(recommendation)
+                # Send to game (wrapped with capabilities declaration)
+                wrapped = wrap_recommendation_with_capabilities(recommendation)
+                self.launcher.send_recommendation(wrapped)
 
                 # PPO update every 256 steps
                 if len(self.agent.buffer) >= 256:
@@ -304,6 +336,21 @@ class UnifiedTrainer:
 
         # Terminal reward from config (±100.0)
         terminal_reward = WIN_REWARD if victory else LOSS_REWARD
+
+        # CRITICAL FIX: Store terminal transition in PPO buffer
+        # Previously terminal reward was only added to local list, never to PPO buffer
+        if states and hasattr(self, '_current_action') and self._current_action is not None:
+            last_state_tensor = state_dict_to_tensor(states[-1])
+            self.agent.store_transition(
+                last_state_tensor,
+                self._current_action,
+                terminal_reward,
+                torch.tensor(0.0),  # Terminal state value estimate is 0
+                self._current_log_prob,
+                done=True
+            )
+
+        # Update local rewards list for stats (kept for compatibility)
         if rewards:
             rewards[-1] += terminal_reward
         else:

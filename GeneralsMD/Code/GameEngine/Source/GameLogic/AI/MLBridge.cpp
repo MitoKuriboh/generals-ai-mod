@@ -30,9 +30,18 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <math.h>   // For isfinite()
+#include <float.h>  // For _finite() fallback on MSVC
 
 #include "GameLogic/MLBridge.h"
+#include "GameLogic/TacticalState.h"
+#include "GameLogic/MicroState.h"
 #include "GameLogic/GameLogic.h"
+
+// MSVC doesn't have isfinite in older versions, use _finite instead
+#ifndef isfinite
+#define isfinite(x) _finite(x)
+#endif
 
 #ifdef _INTERNAL
 // for occasional debugging...
@@ -110,11 +119,16 @@ MLBridge::MLBridge() :
 	m_connected(false),
 	m_hasRecommendation(false),
 	m_lastConnectAttempt(0),
+	m_lastRecommendationFrame(0),
 	m_trainerLaunched(false),
-	m_trainerProcess(NULL)
+	m_trainerProcess(NULL),
+	m_batchedModeEnabled(false),
+	m_hasBatchedResponse(false)
 {
 	m_lastRecommendation.clear();
+	m_lastBatchedResponse.clear();
 	memset(m_readBuffer, 0, READ_BUFFER_SIZE);
+	memset(m_batchedReadBuffer, 0, BATCHED_BUFFER_SIZE);
 }
 
 MLBridge::~MLBridge()
@@ -351,8 +365,9 @@ Bool MLBridge::readMessage(char* buffer, UnsignedInt bufferSize, UnsignedInt& ou
 		return false;
 	}
 
-	if (msgLength >= bufferSize) {
-		DEBUG_LOG(("MLBridge: Message too large (%d bytes)\n", msgLength));
+	// FIX: Leave room for null terminator to prevent buffer overflow
+	if (msgLength >= bufferSize - 1) {
+		DEBUG_LOG(("MLBridge: Message too large (%d bytes, max %d)\n", msgLength, bufferSize - 1));
 		disconnect();
 		return false;
 	}
@@ -373,14 +388,35 @@ Bool MLBridge::readMessage(char* buffer, UnsignedInt bufferSize, UnsignedInt& ou
 // State Export
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
+// Protocol version - increment when state format changes
+static const Int ML_PROTOCOL_VERSION = 2;
+
 AsciiString MLBridge::stateToJson(const MLGameState& state)
 {
 	// Simple JSON serialization (no external library needed)
-	char buffer[2048];
+	// FIX: Use snprintf with buffer size tracking to prevent overflow
+	static const size_t BUFFER_SIZE = 2048;
+	char buffer[BUFFER_SIZE];
+	size_t remaining = BUFFER_SIZE;
+	char* pos = buffer;
+	int written;
 
-	sprintf(buffer,
+	written = snprintf(pos, remaining,
 		"{"
-		"\"player\":%d,"
+		"\"version\":%d,"
+		"\"player\":%d,",
+		ML_PROTOCOL_VERSION,
+		state.playerIndex);
+
+	if (written < 0 || (size_t)written >= remaining) {
+		DEBUG_LOG(("MLBridge: stateToJson buffer overflow in header\n"));
+		return AsciiString("{}");
+	}
+	pos += written;
+	remaining -= written;
+
+	// Continue with remaining fields
+	written = snprintf(pos, remaining,
 		"\"money\":%.2f,"
 		"\"power\":%.2f,"
 		"\"income\":%.2f,"
@@ -403,7 +439,6 @@ AsciiString MLBridge::stateToJson(const MLGameState& state)
 		"\"is_china\":%.1f,"
 		"\"is_gla\":%.1f"
 		"}",
-		state.playerIndex,
 		state.money,
 		state.powerBalance,
 		state.incomeRate,
@@ -426,6 +461,11 @@ AsciiString MLBridge::stateToJson(const MLGameState& state)
 		state.isChina,
 		state.isGLA
 	);
+
+	if (written < 0 || (size_t)written >= remaining) {
+		DEBUG_LOG(("MLBridge: stateToJson buffer overflow in body\n"));
+		return AsciiString("{}");
+	}
 
 	return AsciiString(buffer);
 }
@@ -450,8 +490,9 @@ Bool MLBridge::sendGameEnd(Bool victory, Real gameTimeMinutes, Real finalArmyStr
 	}
 
 	// Send game-end notification as JSON
+	// FIX: Use snprintf with bounds checking to prevent buffer overflow
 	char buffer[256];
-	sprintf(buffer,
+	int written = snprintf(buffer, sizeof(buffer),
 		"{"
 		"\"type\":\"game_end\","
 		"\"victory\":%s,"
@@ -463,6 +504,11 @@ Bool MLBridge::sendGameEnd(Bool victory, Real gameTimeMinutes, Real finalArmyStr
 		finalArmyStrength
 	);
 
+	if (written < 0 || written >= (int)sizeof(buffer)) {
+		DEBUG_LOG(("MLBridge: sendGameEnd buffer overflow\n"));
+		return false;
+	}
+
 	Bool result = writeMessage(buffer, strlen(buffer));
 	DEBUG_LOG(("MLBridge: Sent game end notification (victory=%d)\n", victory));
 	return result;
@@ -473,6 +519,7 @@ Bool MLBridge::sendGameEnd(Bool victory, Real gameTimeMinutes, Real finalArmyStr
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
 // Simple JSON number parser (finds "key":value and returns value)
+// FIX: Added isfinite() validation to reject NaN/Inf values
 static Real parseJsonFloat(const char* json, const char* key, Real defaultValue)
 {
 	char searchKey[64];
@@ -484,7 +531,15 @@ static Real parseJsonFloat(const char* json, const char* key, Real defaultValue)
 	pos += strlen(searchKey);
 	while (*pos == ' ') pos++;
 
-	return (Real)atof(pos);
+	Real value = (Real)atof(pos);
+
+	// Validate the parsed value is finite (not NaN or Inf)
+	if (!isfinite(value)) {
+		DEBUG_LOG(("MLBridge: parseJsonFloat got non-finite value for key '%s', using default\n", key));
+		return defaultValue;
+	}
+
+	return value;
 }
 
 static Int parseJsonInt(const char* json, const char* key, Int defaultValue)
@@ -498,31 +553,109 @@ static Int parseJsonInt(const char* json, const char* key, Int defaultValue)
 	pos += strlen(searchKey);
 	while (*pos == ' ') pos++;
 
-	return atoi(pos);
+	// FIX: Add validation matching parseJsonFloat pattern
+	// Check for valid integer start (digit or minus sign)
+	if (!(*pos == '-' || (*pos >= '0' && *pos <= '9'))) {
+		DEBUG_LOG(("MLBridge: parseJsonInt invalid format for '%s'\n", key));
+		return defaultValue;
+	}
+
+	// Use strtol for better error handling and range checking
+	char* endptr = NULL;
+	long value = strtol(pos, &endptr, 10);
+
+	// Check for conversion failure
+	if (endptr == pos) {
+		DEBUG_LOG(("MLBridge: parseJsonInt conversion failed for '%s'\n", key));
+		return defaultValue;
+	}
+
+	// Check for overflow (Int is typically 32-bit)
+	if (value > 2147483647L || value < -2147483648L) {
+		DEBUG_LOG(("MLBridge: parseJsonInt overflow for '%s'\n", key));
+		return defaultValue;
+	}
+
+	return (Int)value;
+}
+
+// Clamp value to valid range [minVal, maxVal]
+static Real clampReal(Real val, Real minVal, Real maxVal)
+{
+	if (val < minVal) return minVal;
+	if (val > maxVal) return maxVal;
+	return val;
+}
+
+// Parse JSON boolean value (finds "key":true/false and returns value)
+static Bool parseJsonBool(const char* json, const char* key, Bool defaultValue)
+{
+	char searchKey[64];
+	snprintf(searchKey, sizeof(searchKey), "\"%s\":", key);
+
+	const char* pos = strstr(json, searchKey);
+	if (!pos) return defaultValue;
+
+	pos += strlen(searchKey);
+	while (*pos == ' ') pos++;
+
+	if (strncmp(pos, "true", 4) == 0) return true;
+	if (strncmp(pos, "false", 5) == 0) return false;
+
+	return defaultValue;
 }
 
 Bool MLBridge::parseRecommendation(const char* json, MLRecommendation& outRec)
 {
 	outRec.clear();
 
-	// Parse build priorities
-	outRec.priorityEconomy = parseJsonFloat(json, "priority_economy", 0.25f);
-	outRec.priorityDefense = parseJsonFloat(json, "priority_defense", 0.25f);
-	outRec.priorityMilitary = parseJsonFloat(json, "priority_military", 0.25f);
-	outRec.priorityTech = parseJsonFloat(json, "priority_tech", 0.25f);
+	// Parse and validate build priorities (must be in [0, 1])
+	outRec.priorityEconomy = clampReal(parseJsonFloat(json, "priority_economy", 0.25f), 0.0f, 1.0f);
+	outRec.priorityDefense = clampReal(parseJsonFloat(json, "priority_defense", 0.25f), 0.0f, 1.0f);
+	outRec.priorityMilitary = clampReal(parseJsonFloat(json, "priority_military", 0.25f), 0.0f, 1.0f);
+	outRec.priorityTech = clampReal(parseJsonFloat(json, "priority_tech", 0.25f), 0.0f, 1.0f);
 
-	// Parse army preferences
-	outRec.preferInfantry = parseJsonFloat(json, "prefer_infantry", 0.33f);
-	outRec.preferVehicles = parseJsonFloat(json, "prefer_vehicles", 0.34f);
-	outRec.preferAircraft = parseJsonFloat(json, "prefer_aircraft", 0.33f);
+	// Parse and validate army preferences (must be in [0, 1])
+	outRec.preferInfantry = clampReal(parseJsonFloat(json, "prefer_infantry", 0.33f), 0.0f, 1.0f);
+	outRec.preferVehicles = clampReal(parseJsonFloat(json, "prefer_vehicles", 0.34f), 0.0f, 1.0f);
+	outRec.preferAircraft = clampReal(parseJsonFloat(json, "prefer_aircraft", 0.33f), 0.0f, 1.0f);
 
-	// Parse aggression
-	outRec.aggression = parseJsonFloat(json, "aggression", 0.5f);
+	// Parse and validate aggression (must be in [0, 1])
+	outRec.aggression = clampReal(parseJsonFloat(json, "aggression", 0.5f), 0.0f, 1.0f);
 
-	// Parse target
-	outRec.targetPlayer = parseJsonInt(json, "target_player", -1);
+	// Parse target (validate range)
+	Int target = parseJsonInt(json, "target_player", -1);
+	outRec.targetPlayer = (target >= -1 && target < 8) ? target : -1;
 
 	outRec.valid = true;
+
+	// Parse capabilities and update batched mode
+	MLCapabilities caps;
+	if (parseCapabilities(json, caps)) {
+		m_serverCapabilities = caps;
+		m_batchedModeEnabled = caps.hierarchical;
+		DEBUG_LOG(("MLBridge: Capabilities updated - hierarchical=%d, tactical=%d, micro=%d\n",
+			caps.hierarchical, caps.tactical, caps.micro));
+	}
+
+	return true;
+}
+
+Bool MLBridge::parseCapabilities(const char* json, MLCapabilities& outCaps)
+{
+	// Look for "capabilities" object
+	const char* capsStart = strstr(json, "\"capabilities\"");
+	if (!capsStart) return false;
+
+	// Find the opening brace of the capabilities object
+	const char* braceStart = strchr(capsStart, '{');
+	if (!braceStart) return false;
+
+	// Parse within the capabilities object (search from capsStart, not whole json)
+	outCaps.hierarchical = parseJsonBool(capsStart, "hierarchical", false);
+	outCaps.tactical = parseJsonBool(capsStart, "tactical", false);
+	outCaps.micro = parseJsonBool(capsStart, "micro", false);
+
 	return true;
 }
 
@@ -540,6 +673,413 @@ Bool MLBridge::receiveRecommendation(MLRecommendation& outRec)
 	if (parseRecommendation(m_readBuffer, outRec)) {
 		m_lastRecommendation = outRec;
 		m_hasRecommendation = true;
+		m_lastRecommendationFrame = TheGameLogic ? TheGameLogic->getFrame() : 0;
+		return true;
+	}
+
+	return false;
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
+// Recommendation Staleness Check
+///////////////////////////////////////////////////////////////////////////////////////////////////
+
+Bool MLBridge::isRecommendationStale() const
+{
+	if (!m_hasRecommendation) {
+		return true;  // No recommendation yet = stale
+	}
+
+	UnsignedInt currentFrame = TheGameLogic ? TheGameLogic->getFrame() : 0;
+	return (currentFrame - m_lastRecommendationFrame) > RECOMMENDATION_TIMEOUT_FRAMES;
+}
+
+MLRecommendation MLBridge::getValidRecommendation() const
+{
+	if (isRecommendationStale()) {
+		// Return defaults when stale
+		MLRecommendation defaults;
+		defaults.clear();
+		defaults.valid = false;  // Mark as invalid so AI uses parent logic
+		return defaults;
+	}
+	return m_lastRecommendation;
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
+// Batched Protocol Implementation
+///////////////////////////////////////////////////////////////////////////////////////////////////
+
+void MLBatchedRequest::clear()
+{
+	frame = 0;
+	playerIndex = 0;
+	strategic.clear();
+	numTeams = 0;
+	numUnits = 0;
+	memset(teamIds, 0, sizeof(teamIds));
+	memset(unitIds, 0, sizeof(unitIds));
+}
+
+void MLBatchedResponse::clear()
+{
+	frame = 0;
+	version = 0;
+	strategic.clear();
+	numTeamCommands = 0;
+	numUnitCommands = 0;
+}
+
+void MLBridge::addTeamToBatch(MLBatchedRequest& request, Int teamId, const TacticalState& state)
+{
+	if (request.numTeams >= MAX_TEAMS_PER_BATCH) {
+		DEBUG_LOG(("MLBridge: Team batch full, skipping team %d\n", teamId));
+		return;
+	}
+
+	Int idx = request.numTeams++;
+	request.teamIds[idx] = teamId;
+	request.teamStates[idx] = state;
+}
+
+void MLBridge::addUnitToBatch(MLBatchedRequest& request, ObjectID unitId, const MicroState& state)
+{
+	if (request.numUnits >= MAX_UNITS_PER_BATCH) {
+		DEBUG_LOG(("MLBridge: Unit batch full, skipping unit %d\n", unitId));
+		return;
+	}
+
+	Int idx = request.numUnits++;
+	request.unitIds[idx] = unitId;
+	request.unitStates[idx] = state;
+}
+
+AsciiString MLBridge::batchedRequestToJson(const MLBatchedRequest& request)
+{
+	// Build JSON for batched request
+	// Format:
+	// {
+	//   "frame": 1234,
+	//   "player_id": 3,
+	//   "strategic": { ... },
+	//   "teams": [ {"id": 1, "state": [64 floats]}, ... ],
+	//   "units": [ {"id": 101, "state": [32 floats]}, ... ]
+	// }
+
+	char* buffer = m_batchedReadBuffer;  // Reuse buffer for building
+	size_t remaining = BATCHED_BUFFER_SIZE;
+	char* pos = buffer;
+	int written;
+
+	// Header
+	written = snprintf(pos, remaining,
+		"{\"frame\":%u,\"player_id\":%d,",
+		request.frame, request.playerIndex);
+	if (written < 0 || (size_t)written >= remaining) return AsciiString("{}");
+	pos += written; remaining -= written;
+
+	// Strategic state (inline the important fields)
+	written = snprintf(pos, remaining,
+		"\"strategic\":{"
+		"\"money\":%.2f,\"power\":%.2f,\"income\":%.2f,\"supply\":%.2f,"
+		"\"own_infantry\":[%.2f,%.2f,%.2f],"
+		"\"own_vehicles\":[%.2f,%.2f,%.2f],"
+		"\"own_aircraft\":[%.2f,%.2f,%.2f],"
+		"\"own_structures\":[%.2f,%.2f,%.2f],"
+		"\"enemy_infantry\":[%.2f,%.2f,%.2f],"
+		"\"enemy_vehicles\":[%.2f,%.2f,%.2f],"
+		"\"enemy_aircraft\":[%.2f,%.2f,%.2f],"
+		"\"enemy_structures\":[%.2f,%.2f,%.2f],"
+		"\"game_time\":%.2f,\"tech_level\":%.2f,\"base_threat\":%.2f,"
+		"\"army_strength\":%.2f,\"under_attack\":%.1f,\"distance_to_enemy\":%.2f,"
+		"\"is_usa\":%.1f,\"is_china\":%.1f,\"is_gla\":%.1f}",
+		request.strategic.money, request.strategic.powerBalance,
+		request.strategic.incomeRate, request.strategic.supplyUsed,
+		request.strategic.ownInfantry[0], request.strategic.ownInfantry[1], request.strategic.ownInfantry[2],
+		request.strategic.ownVehicles[0], request.strategic.ownVehicles[1], request.strategic.ownVehicles[2],
+		request.strategic.ownAircraft[0], request.strategic.ownAircraft[1], request.strategic.ownAircraft[2],
+		request.strategic.ownStructures[0], request.strategic.ownStructures[1], request.strategic.ownStructures[2],
+		request.strategic.enemyInfantry[0], request.strategic.enemyInfantry[1], request.strategic.enemyInfantry[2],
+		request.strategic.enemyVehicles[0], request.strategic.enemyVehicles[1], request.strategic.enemyVehicles[2],
+		request.strategic.enemyAircraft[0], request.strategic.enemyAircraft[1], request.strategic.enemyAircraft[2],
+		request.strategic.enemyStructures[0], request.strategic.enemyStructures[1], request.strategic.enemyStructures[2],
+		request.strategic.gameTimeMinutes, request.strategic.techLevel, request.strategic.baseThreat,
+		request.strategic.armyStrength, request.strategic.underAttack, request.strategic.distanceToEnemy,
+		request.strategic.isUSA, request.strategic.isChina, request.strategic.isGLA);
+	if (written < 0 || (size_t)written >= remaining) return AsciiString("{}");
+	pos += written; remaining -= written;
+
+	// Teams array
+	if (request.numTeams > 0) {
+		written = snprintf(pos, remaining, ",\"teams\":[");
+		if (written < 0 || (size_t)written >= remaining) return AsciiString("{}");
+		pos += written; remaining -= written;
+
+		for (Int i = 0; i < request.numTeams; i++) {
+			if (i > 0) {
+				written = snprintf(pos, remaining, ",");
+				if (written < 0 || (size_t)written >= remaining) return AsciiString("{}");
+				pos += written; remaining -= written;
+			}
+
+			// Serialize team state as array of floats
+			Real stateArray[TacticalState::DIM];
+			request.teamStates[i].toFloatArray(stateArray);
+
+			written = snprintf(pos, remaining, "{\"id\":%d,\"state\":[", request.teamIds[i]);
+			if (written < 0 || (size_t)written >= remaining) return AsciiString("{}");
+			pos += written; remaining -= written;
+
+			for (UnsignedInt j = 0; j < TacticalState::DIM; j++) {
+				written = snprintf(pos, remaining, j > 0 ? ",%.3f" : "%.3f", stateArray[j]);
+				if (written < 0 || (size_t)written >= remaining) return AsciiString("{}");
+				pos += written; remaining -= written;
+			}
+
+			written = snprintf(pos, remaining, "]}");
+			if (written < 0 || (size_t)written >= remaining) return AsciiString("{}");
+			pos += written; remaining -= written;
+		}
+
+		written = snprintf(pos, remaining, "]");
+		if (written < 0 || (size_t)written >= remaining) return AsciiString("{}");
+		pos += written; remaining -= written;
+	}
+
+	// Units array
+	if (request.numUnits > 0) {
+		written = snprintf(pos, remaining, ",\"units\":[");
+		if (written < 0 || (size_t)written >= remaining) return AsciiString("{}");
+		pos += written; remaining -= written;
+
+		for (Int i = 0; i < request.numUnits; i++) {
+			if (i > 0) {
+				written = snprintf(pos, remaining, ",");
+				if (written < 0 || (size_t)written >= remaining) return AsciiString("{}");
+				pos += written; remaining -= written;
+			}
+
+			// Serialize unit state as array of floats
+			Real stateArray[MicroState::DIM];
+			request.unitStates[i].toFloatArray(stateArray);
+
+			written = snprintf(pos, remaining, "{\"id\":%u,\"state\":[", request.unitIds[i]);
+			if (written < 0 || (size_t)written >= remaining) return AsciiString("{}");
+			pos += written; remaining -= written;
+
+			for (UnsignedInt j = 0; j < MicroState::DIM; j++) {
+				written = snprintf(pos, remaining, j > 0 ? ",%.3f" : "%.3f", stateArray[j]);
+				if (written < 0 || (size_t)written >= remaining) return AsciiString("{}");
+				pos += written; remaining -= written;
+			}
+
+			written = snprintf(pos, remaining, "]}");
+			if (written < 0 || (size_t)written >= remaining) return AsciiString("{}");
+			pos += written; remaining -= written;
+		}
+
+		written = snprintf(pos, remaining, "]");
+		if (written < 0 || (size_t)written >= remaining) return AsciiString("{}");
+		pos += written; remaining -= written;
+	}
+
+	// Close object
+	written = snprintf(pos, remaining, "}");
+	if (written < 0 || (size_t)written >= remaining) return AsciiString("{}");
+
+	return AsciiString(buffer);
+}
+
+Bool MLBridge::sendBatchedState(const MLBatchedRequest& request)
+{
+	if (!m_connected) {
+		if (!connect()) {
+			return false;
+		}
+	}
+
+	AsciiString json = batchedRequestToJson(request);
+	return writeMessage(json.str(), json.getLength());
+}
+
+Bool MLBridge::parseTacticalCommand(const char* json, TacticalCommand& outCmd)
+{
+	outCmd.clear();
+
+	outCmd.teamId = parseJsonInt(json, "id", -1);
+	if (outCmd.teamId < 0) return false;
+
+	Int actionInt = parseJsonInt(json, "action", TACTICAL_HOLD);
+	if (actionInt < 0 || actionInt >= TACTICAL_ACTION_COUNT) {
+		actionInt = TACTICAL_HOLD;
+	}
+	outCmd.action = (TacticalActionType)actionInt;
+
+	outCmd.targetX = clampReal(parseJsonFloat(json, "x", 0.5f), 0.0f, 1.0f);
+	outCmd.targetY = clampReal(parseJsonFloat(json, "y", 0.5f), 0.0f, 1.0f);
+	outCmd.attitude = clampReal(parseJsonFloat(json, "attitude", 0.5f), 0.0f, 1.0f);
+
+	outCmd.valid = true;
+	return true;
+}
+
+Bool MLBridge::parseMicroCommand(const char* json, MicroCommand& outCmd)
+{
+	outCmd.clear();
+
+	outCmd.unitId = (ObjectID)parseJsonInt(json, "id", INVALID_ID);
+	if (outCmd.unitId == INVALID_ID) return false;
+
+	Int actionInt = parseJsonInt(json, "action", MICRO_FOLLOW_TEAM);
+	if (actionInt < 0 || actionInt >= MICRO_ACTION_COUNT) {
+		actionInt = MICRO_FOLLOW_TEAM;
+	}
+	outCmd.action = (MicroActionType)actionInt;
+
+	// Angle is in radians, -pi to pi, normalized to -1 to 1 in transmission
+	outCmd.moveAngle = clampReal(parseJsonFloat(json, "angle", 0.0f), -1.0f, 1.0f) * 3.14159265f;
+	outCmd.moveDistance = clampReal(parseJsonFloat(json, "dist", 0.0f), 0.0f, 1.0f);
+
+	outCmd.valid = true;
+	return true;
+}
+
+// Find next JSON object in array starting from position
+static const char* findNextArrayObject(const char* start)
+{
+	const char* pos = start;
+	while (*pos && *pos != '{') pos++;
+	if (*pos != '{') return NULL;
+	return pos;
+}
+
+// Find end of JSON object (matching closing brace)
+static const char* findObjectEnd(const char* start)
+{
+	if (*start != '{') return NULL;
+
+	const char* pos = start + 1;
+	int depth = 1;
+
+	while (*pos && depth > 0) {
+		if (*pos == '{') depth++;
+		else if (*pos == '}') depth--;
+		pos++;
+	}
+
+	return depth == 0 ? pos : NULL;
+}
+
+Bool MLBridge::parseBatchedResponse(const char* json, MLBatchedResponse& outResponse)
+{
+	outResponse.clear();
+
+	// Parse frame and version
+	outResponse.frame = (UnsignedInt)parseJsonInt(json, "frame", 0);
+	outResponse.version = parseJsonInt(json, "version", 0);
+
+	// Parse capabilities and update batched mode (do this before strategic to set mode early)
+	MLCapabilities caps;
+	if (parseCapabilities(json, caps)) {
+		m_serverCapabilities = caps;
+		m_batchedModeEnabled = caps.hierarchical;
+	}
+
+	// Parse strategic recommendation
+	const char* strategicStart = strstr(json, "\"strategic\":");
+	if (strategicStart) {
+		strategicStart = strchr(strategicStart, '{');
+		if (strategicStart) {
+			// Note: parseRecommendation also tries to parse capabilities, but that's harmless
+			parseRecommendation(strategicStart, outResponse.strategic);
+		}
+	}
+
+	// Parse team commands
+	const char* teamsStart = strstr(json, "\"teams\":");
+	if (teamsStart) {
+		teamsStart = strchr(teamsStart, '[');
+		if (teamsStart) {
+			const char* pos = teamsStart + 1;
+			while ((pos = findNextArrayObject(pos)) != NULL) {
+				if (outResponse.numTeamCommands >= MAX_TEAMS_PER_BATCH) break;
+
+				const char* objEnd = findObjectEnd(pos);
+				if (!objEnd) break;
+
+				// Extract object as substring for parsing
+				size_t objLen = objEnd - pos;
+				if (objLen < BATCHED_BUFFER_SIZE - 1) {
+					char objBuffer[1024];
+					if (objLen < sizeof(objBuffer) - 1) {
+						strncpy(objBuffer, pos, objLen);
+						objBuffer[objLen] = '\0';
+
+						TacticalCommand cmd;
+						if (parseTacticalCommand(objBuffer, cmd)) {
+							outResponse.teamCommands[outResponse.numTeamCommands++] = cmd;
+						}
+					}
+				}
+
+				pos = objEnd;
+			}
+		}
+	}
+
+	// Parse unit commands
+	const char* unitsStart = strstr(json, "\"units\":");
+	if (unitsStart) {
+		unitsStart = strchr(unitsStart, '[');
+		if (unitsStart) {
+			const char* pos = unitsStart + 1;
+			while ((pos = findNextArrayObject(pos)) != NULL) {
+				if (outResponse.numUnitCommands >= MAX_UNITS_PER_BATCH) break;
+
+				const char* objEnd = findObjectEnd(pos);
+				if (!objEnd) break;
+
+				// Extract object as substring for parsing
+				size_t objLen = objEnd - pos;
+				if (objLen < 1024) {
+					char objBuffer[1024];
+					strncpy(objBuffer, pos, objLen);
+					objBuffer[objLen] = '\0';
+
+					MicroCommand cmd;
+					if (parseMicroCommand(objBuffer, cmd)) {
+						outResponse.unitCommands[outResponse.numUnitCommands++] = cmd;
+					}
+				}
+
+				pos = objEnd;
+			}
+		}
+	}
+
+	return true;
+}
+
+Bool MLBridge::receiveBatchedResponse(MLBatchedResponse& outResponse)
+{
+	if (!m_connected) {
+		return false;
+	}
+
+	UnsignedInt length = 0;
+	if (!readMessage(m_batchedReadBuffer, BATCHED_BUFFER_SIZE - 1, length)) {
+		return false;
+	}
+
+	if (parseBatchedResponse(m_batchedReadBuffer, outResponse)) {
+		m_lastBatchedResponse = outResponse;
+		m_hasBatchedResponse = true;
+
+		// Also update strategic recommendation for backward compatibility
+		m_lastRecommendation = outResponse.strategic;
+		m_hasRecommendation = true;
+		m_lastRecommendationFrame = TheGameLogic ? TheGameLogic->getFrame() : 0;
+
 		return true;
 	}
 

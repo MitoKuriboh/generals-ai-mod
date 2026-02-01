@@ -208,3 +208,37 @@ python -m training.train --simulated --episodes 100
    agent = PPOAgent(PPOConfig())
    agent.load('checkpoints/best_agent.pt')
    ```
+
+## Checkpoint Management
+
+Checkpoints are saved every 10 episodes (configurable via `CHECKPOINT_INTERVAL` in `training/config.py`).
+
+### Cleanup Old Checkpoints
+
+Training generates many checkpoint files. To keep only the most recent:
+
+```bash
+# Keep last 5 checkpoints (Linux/WSL)
+cd checkpoints/unified
+ls -t agent_ep*.pt | tail -n +6 | xargs rm -f
+
+# Keep only checkpoints divisible by 50 (milestone saves)
+find . -name "agent_ep*.pt" | grep -vE "agent_ep(50|100|150|200|250|300|350|400|450|500)\.pt" | xargs rm -f
+```
+
+### Checkpoint Directory Structure
+
+```
+checkpoints/unified/
+├── agent_ep10.pt       # Episode 10 checkpoint
+├── agent_ep20.pt       # Episode 20 checkpoint
+├── ...
+├── agent_ep350.pt      # Latest checkpoint
+└── best_agent.pt       # Best performing model (optional)
+```
+
+### Storage Estimates
+
+- Each checkpoint: ~1-2 MB
+- 500 episodes at interval=10: ~50 checkpoints = ~100 MB
+- Recommendation: Keep last 5 + milestone saves

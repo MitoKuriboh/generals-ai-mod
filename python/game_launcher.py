@@ -382,8 +382,9 @@ class GameLauncher:
             # Game crashed or was interrupted
             return None
 
-        # Add terminal reward
-        terminal_reward = 1.0 if victory else -1.0
+        # FIX: Use config.py values for consistency (±100.0 instead of ±1.0)
+        from training.config import WIN_REWARD, LOSS_REWARD
+        terminal_reward = WIN_REWARD if victory else LOSS_REWARD
         if rewards:
             rewards[-1] += terminal_reward
         else:
@@ -424,6 +425,12 @@ class GameLauncher:
     def _default_policy(self, state: Dict) -> Dict[str, Any]:
         """Default balanced policy when no ML model provided."""
         return {
+            'version': 2,
+            'capabilities': {
+                'hierarchical': False,
+                'tactical': False,
+                'micro': False,
+            },
             'priority_economy': 0.25,
             'priority_defense': 0.25,
             'priority_military': 0.30,

@@ -75,7 +75,34 @@ def setup_logging(log_dir: str = "logs"):
 from training.ppo import PPOAgent, PPOConfig
 from training.model import state_dict_to_tensor, action_tensor_to_dict, STATE_DIM
 from training.rewards import calculate_step_reward, RewardConfig
-from training.config import WIN_REWARD, LOSS_REWARD
+from training.config import WIN_REWARD, LOSS_REWARD, PROTOCOL_VERSION
+
+
+def wrap_recommendation_with_capabilities(recommendation: Dict) -> Dict:
+    """
+    Wrap a strategic recommendation with capabilities declaration.
+
+    Strategic-only servers declare hierarchical=false so the game
+    doesn't try to use tactical/micro layers.
+    """
+    return {
+        'version': PROTOCOL_VERSION,
+        'capabilities': {
+            'hierarchical': False,
+            'tactical': False,
+            'micro': False,
+        },
+        **recommendation
+    }
+
+
+def validate_protocol_version(state: dict) -> bool:
+    """Validate protocol version from game state. Returns True if valid."""
+    version = state.get('version', 1)
+    if version != PROTOCOL_VERSION:
+        logging.warning(f"Protocol mismatch: expected {PROTOCOL_VERSION}, got {version}")
+        return False
+    return True
 
 # Windows named pipe support
 if sys.platform == 'win32':
@@ -332,6 +359,10 @@ class ManualTrainer:
                 final_army = state.get('army_strength', 0.0)
                 break
 
+            # Validate protocol version on first state
+            if len(self.current_episode_states) == 0:
+                validate_protocol_version(state)
+
             # Store state
             self.current_episode_states.append(state)
 
@@ -359,8 +390,9 @@ class ManualTrainer:
                 done=False
             )
 
-            # Send recommendation to game
-            self._write_message(recommendation)
+            # Send recommendation to game (wrapped with capabilities declaration)
+            wrapped = wrap_recommendation_with_capabilities(recommendation)
+            self._write_message(wrapped)
 
             # PPO update every 256 steps
             if len(self.agent.buffer) >= 256:
@@ -378,6 +410,21 @@ class ManualTrainer:
 
         # Terminal reward from config (±100.0)
         terminal_reward = WIN_REWARD if victory else LOSS_REWARD
+
+        # CRITICAL FIX: Store terminal transition in PPO buffer
+        # Previously terminal reward was only added to local list, never to PPO buffer
+        if self.current_episode_states and self._current_action is not None:
+            last_state_tensor = state_dict_to_tensor(self.current_episode_states[-1])
+            self.agent.store_transition(
+                last_state_tensor,
+                self._current_action,
+                terminal_reward,
+                torch.tensor(0.0),  # Terminal state value estimate is 0
+                self._current_log_prob,
+                done=True
+            )
+
+        # Update local rewards list for stats (kept for compatibility)
         if self.current_episode_rewards:
             self.current_episode_rewards[-1] += terminal_reward
 

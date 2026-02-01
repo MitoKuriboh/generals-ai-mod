@@ -269,14 +269,21 @@ class GeneralsEnv:
         Returns:
             (terminated, won): Whether episode ended and if we won
         """
+        # FIX: Lowered threshold from 0.3 to 0.1 (log10(1+1)=0.3 means 1 building,
+        # log10(0+1)=0 means 0 buildings). Threshold 0.1 means truly no buildings.
+        STRUCTURE_THRESHOLD = 0.1
+
         # Check if we lost (no structures)
         own_structures = state.get('own_structures', [0, 0, 0])
-        if own_structures[0] < 0.3:  # Less than 1 structure (log scale)
+        if own_structures[0] < STRUCTURE_THRESHOLD:
             return True, False
 
         # Check if enemy lost (no visible structures for a while)
+        # FIX: Added check that WE still have structures (mutual destruction != victory)
         enemy_structures = state.get('enemy_structures', [0, 0, 0])
-        if enemy_structures[0] < 0.3 and state.get('game_time', 0) > 5.0:
+        if (enemy_structures[0] < STRUCTURE_THRESHOLD and
+            own_structures[0] >= STRUCTURE_THRESHOLD and
+            state.get('game_time', 0) > 5.0):
             # No enemy structures visible and game has been running
             # This is a heuristic - actual win detection would need game events
             return True, True

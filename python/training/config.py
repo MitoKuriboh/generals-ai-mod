@@ -9,6 +9,11 @@ import os
 from pathlib import Path
 
 # =============================================================================
+# Protocol Version (MUST match C++ ML_PROTOCOL_VERSION in MLBridge.cpp)
+# =============================================================================
+PROTOCOL_VERSION = 2  # Increment when state/recommendation format changes
+
+# =============================================================================
 # Dimensions (MUST match C++ MLGameState/MLRecommendation structs)
 # =============================================================================
 STATE_DIM = 44   # Features from game state

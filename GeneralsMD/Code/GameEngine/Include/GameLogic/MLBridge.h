@@ -37,6 +37,28 @@
 // Forward declarations
 class Player;
 class Object;
+class Team;
+
+// Include hierarchical state definitions
+#include "GameLogic/TacticalState.h"
+#include "GameLogic/MicroState.h"
+
+// Maximum entities in a batched request
+static const Int MAX_TEAMS_PER_BATCH = 16;
+static const Int MAX_UNITS_PER_BATCH = 64;
+
+/**
+ * Server capabilities declared in response.
+ * Used to enable/disable hierarchical features based on what server supports.
+ */
+struct MLCapabilities
+{
+	Bool hierarchical;  // Server supports batched tactical/micro requests
+	Bool tactical;      // Server has tactical layer model loaded
+	Bool micro;         // Server has micro layer model loaded
+
+	MLCapabilities() : hierarchical(false), tactical(false), micro(false) {}
+};
 
 /**
  * Game state exported to ML system.
@@ -113,6 +135,52 @@ struct MLRecommendation
 };
 
 /**
+ * Batched request containing all layer states for a single frame.
+ */
+struct MLBatchedRequest
+{
+	UnsignedInt frame;          // Current game frame
+	Int playerIndex;            // Player this state is for
+
+	// Strategic state (always present)
+	MLGameState strategic;
+
+	// Team states (variable count)
+	Int numTeams;
+	Int teamIds[MAX_TEAMS_PER_BATCH];
+	TacticalState teamStates[MAX_TEAMS_PER_BATCH];
+
+	// Unit states (variable count, only units needing micro)
+	Int numUnits;
+	ObjectID unitIds[MAX_UNITS_PER_BATCH];
+	MicroState unitStates[MAX_UNITS_PER_BATCH];
+
+	void clear();
+};
+
+/**
+ * Batched response containing all layer recommendations.
+ */
+struct MLBatchedResponse
+{
+	UnsignedInt frame;          // Frame this response is for
+	Int version;                // Protocol version
+
+	// Strategic recommendation (always present)
+	MLRecommendation strategic;
+
+	// Tactical commands (variable count)
+	Int numTeamCommands;
+	TacticalCommand teamCommands[MAX_TEAMS_PER_BATCH];
+
+	// Micro commands (variable count)
+	Int numUnitCommands;
+	MicroCommand unitCommands[MAX_UNITS_PER_BATCH];
+
+	void clear();
+};
+
+/**
  * ML Bridge - Handles communication with Python ML process via named pipe.
  *
  * Protocol:
@@ -143,11 +211,48 @@ public:
 	// Recommendation retrieval (non-blocking)
 	Bool receiveRecommendation(MLRecommendation& outRec);
 
+	// ========================================================================
+	// Batched Protocol (for hierarchical inference)
+	// ========================================================================
+
+	// Send batched state for all layers
+	Bool sendBatchedState(const MLBatchedRequest& request);
+
+	// Receive batched response for all layers
+	Bool receiveBatchedResponse(MLBatchedResponse& outResponse);
+
+	// Add a team to the current batch
+	void addTeamToBatch(MLBatchedRequest& request, Int teamId, const TacticalState& state);
+
+	// Add a unit to the current batch
+	void addUnitToBatch(MLBatchedRequest& request, ObjectID unitId, const MicroState& state);
+
+	// Check if batched mode is enabled
+	Bool isBatchedModeEnabled() const { return m_batchedModeEnabled; }
+
+	// Enable/disable batched mode
+	void setBatchedModeEnabled(Bool enabled) { m_batchedModeEnabled = enabled; }
+
+	// Get server capabilities (parsed from responses)
+	const MLCapabilities& getCapabilities() const { return m_serverCapabilities; }
+
+	// Get last batched response
+	const MLBatchedResponse& getLastBatchedResponse() const { return m_lastBatchedResponse; }
+
+	// Check if batched response is available
+	Bool hasBatchedResponse() const { return m_hasBatchedResponse; }
+
 	// Check if we have a pending recommendation
 	Bool hasRecommendation() const { return m_hasRecommendation; }
 
-	// Get last received recommendation
+	// Check if recommendation is stale (hasn't been updated recently)
+	Bool isRecommendationStale() const;
+
+	// Get last received recommendation (returns defaults if stale)
 	const MLRecommendation& getLastRecommendation() const { return m_lastRecommendation; }
+
+	// Get valid recommendation (fresh or defaults)
+	MLRecommendation getValidRecommendation() const;
 
 	// Pipe name for connection
 	static const char* getPipeName() { return "\\\\.\\pipe\\generals_ml_bridge"; }
@@ -158,6 +263,21 @@ private:
 
 	// Parse recommendation from JSON
 	Bool parseRecommendation(const char* json, MLRecommendation& outRec);
+
+	// Serialize batched request to JSON
+	AsciiString batchedRequestToJson(const MLBatchedRequest& request);
+
+	// Parse batched response from JSON
+	Bool parseBatchedResponse(const char* json, MLBatchedResponse& outResponse);
+
+	// Parse capabilities from JSON response
+	Bool parseCapabilities(const char* json, MLCapabilities& outCaps);
+
+	// Parse tactical command from JSON object
+	Bool parseTacticalCommand(const char* json, TacticalCommand& outCmd);
+
+	// Parse micro command from JSON object
+	Bool parseMicroCommand(const char* json, MicroCommand& outCmd);
 
 	// Low-level pipe operations
 	Bool writeMessage(const char* data, UnsignedInt length);
@@ -179,9 +299,23 @@ private:
 	UnsignedInt m_lastConnectAttempt;
 	static const UnsignedInt RECONNECT_INTERVAL_FRAMES = 300; // ~10 seconds
 
+	// Recommendation staleness tracking
+	UnsignedInt m_lastRecommendationFrame;  // Frame when last recommendation received
+	static const UnsignedInt RECOMMENDATION_TIMEOUT_FRAMES = 60; // 2 seconds at 30 FPS
+
 	// Trainer process management
 	Bool m_trainerLaunched;
 	void* m_trainerProcess;  // HANDLE to trainer process
+
+	// Batched protocol state
+	Bool m_batchedModeEnabled;
+	Bool m_hasBatchedResponse;
+	MLBatchedResponse m_lastBatchedResponse;
+	MLCapabilities m_serverCapabilities;
+
+	// Larger buffer for batched messages
+	static const UnsignedInt BATCHED_BUFFER_SIZE = 32768;
+	char m_batchedReadBuffer[BATCHED_BUFFER_SIZE];
 };
 
 #endif // _ML_BRIDGE_H_

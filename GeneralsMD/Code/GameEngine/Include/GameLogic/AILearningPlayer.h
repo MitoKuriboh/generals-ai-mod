@@ -39,13 +39,17 @@
 class BuildListInfo;
 class SpecialPowerTemplate;
 class TeamPrototype;
+class Team;
+class AIGroup;
 
 // =============================================================================
 // ML Configuration Constants
 // =============================================================================
 namespace MLConfig {
     // Decision timing
-    static const UnsignedInt DECISION_INTERVAL = 30;           // Frames between ML decisions (~1 sec)
+    // Game runs at 30 FPS, so 30 frames = 1 second between ML decisions
+    // This balances responsiveness with avoiding decision spam
+    static const UnsignedInt DECISION_INTERVAL = 30;
     static const Real MAX_ATTACK_HOLD_SECONDS = 30.0f;         // Max time to hold teams before attacking
 
     // Spatial calculations
@@ -142,11 +146,41 @@ private:
 	Bool shouldDelayBuilding(BuildingCategory category);
 
 	// Attack timing based on aggression
-	Bool shouldHoldTeam();
 	Int getMinArmySizeForAttack();
 
 	// Check for game end and notify ML
 	void checkGameEnd();
+
+	// ========================================================================
+	// Hierarchical Control - Tactical and Micro layers
+	// ========================================================================
+
+	// Process tactical decisions for all active teams
+	void processTeamTactics();
+
+	// Process micro decisions for units in combat
+	void processMicroControl();
+
+	// Build tactical state for a team
+	void buildTeamTacticalState(Team* team, TacticalState& outState);
+
+	// Execute tactical command on a team
+	void executeTacticalCommand(Team* team, const TacticalCommand& cmd);
+
+	// Build micro state for a unit
+	void buildUnitMicroState(Object* unit, MicroState& outState);
+
+	// Execute micro command on a unit
+	void executeMicroCommand(Object* unit, const MicroCommand& cmd);
+
+	// Check if a team needs tactical update this frame
+	Bool teamNeedsTacticalUpdate(Team* team);
+
+	// Check if a unit needs micro control this frame
+	Bool unitNeedsMicroUpdate(Object* unit);
+
+	// Get base position for retreat calculations
+	Bool getBasePosition(Coord3D& outPos);
 
 	// ML Bridge instance
 	MLBridge m_mlBridge;
@@ -173,6 +207,36 @@ private:
 	Real calculateIncomeRate();
 	Real calculateSupplyUsed();
 	Real calculateUnderAttack();
+
+	// ========================================================================
+	// Hierarchical Control State
+	// ========================================================================
+
+	// Tactical layer configuration
+	Bool m_tacticalEnabled;                 // Enable tactical layer
+	UnsignedInt m_tacticalDecisionInterval; // Frames between tactical updates
+
+	// Micro layer configuration
+	Bool m_microEnabled;                    // Enable micro layer
+	UnsignedInt m_microDecisionInterval;    // Frames between micro updates
+
+	// Per-team tracking (using simple arrays since team count is bounded)
+	static const Int MAX_TRACKED_TEAMS = 32;
+	UnsignedInt m_lastTacticalFrame[MAX_TRACKED_TEAMS];  // Frame of last tactical update per team
+
+	// Per-unit tracking (using map for dynamic unit IDs)
+	// Note: In a real implementation, would use a more efficient structure
+	static const Int MAX_TRACKED_UNITS = 128;
+	ObjectID m_trackedUnitIds[MAX_TRACKED_UNITS];
+	UnsignedInt m_lastMicroFrame[MAX_TRACKED_UNITS];
+	Int m_trackedUnitCount;
+
+	// Cached strategic output for tactical layer
+	Real m_strategicOutput[8];
+
+	// Base position cache
+	Coord3D m_cachedBasePos;
+	Bool m_hasValidBasePos;
 };
 
 #endif // _AI_LEARNING_PLAYER_H_
