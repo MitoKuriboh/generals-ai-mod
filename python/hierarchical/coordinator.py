@@ -14,6 +14,10 @@ import numpy as np
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 import time
+import math
+import logging
+
+logger = logging.getLogger(__name__)
 
 # Import layer modules
 import sys
@@ -118,41 +122,68 @@ class HierarchicalCoordinator:
 
         # Strategic layer (runs every strategic_interval frames)
         if current_frame - self.last_strategic_frame >= self.config.strategic_interval:
-            t0 = time.perf_counter()
-            result['strategic'] = self._process_strategic(game_state)
-            self.latency_stats['strategic'].append(time.perf_counter() - t0)
-            self.last_strategic_frame = current_frame
-            self.last_strategic_output = np.array([
-                result['strategic'][k] for k in [
-                    'priority_economy', 'priority_defense', 'priority_military',
-                    'priority_tech', 'prefer_infantry', 'prefer_vehicles',
-                    'prefer_aircraft', 'aggression'
-                ]
-            ])
+            try:
+                t0 = time.perf_counter()
+                result['strategic'] = self._process_strategic(game_state)
+                self.latency_stats['strategic'].append(time.perf_counter() - t0)
+                self.last_strategic_frame = current_frame
+                self.last_strategic_output = np.array([
+                    result['strategic'][k] for k in [
+                        'priority_economy', 'priority_defense', 'priority_military',
+                        'priority_tech', 'prefer_infantry', 'prefer_vehicles',
+                        'prefer_aircraft', 'aggression'
+                    ]
+                ])
+            except Exception as e:
+                logger.error(f"Strategic inference failed: {e}")
+                result['strategic'] = self._default_strategic()
 
         # Tactical layer (runs per team when due)
         if self.config.tactical_enabled and self.tactical is not None:
-            t0 = time.perf_counter()
-            teams_to_process = self._get_teams_due(game_state, current_frame)
-            if teams_to_process:
-                result['teams'] = self._process_tactical_batch(
-                    game_state, teams_to_process, current_frame
-                )
-            if result['teams']:
-                self.latency_stats['tactical'].append(time.perf_counter() - t0)
+            try:
+                t0 = time.perf_counter()
+                teams_to_process = self._get_teams_due(game_state, current_frame)
+                if teams_to_process:
+                    result['teams'] = self._process_tactical_batch(
+                        game_state, teams_to_process, current_frame
+                    )
+                if result['teams']:
+                    self.latency_stats['tactical'].append(time.perf_counter() - t0)
+            except Exception as e:
+                logger.error(f"Tactical inference failed: {e}")
+                result['teams'] = []
 
         # Micro layer (runs per unit in combat when due)
+        # FIX: Check self.micro is not None before processing
         if self.config.micro_enabled and self.micro is not None:
-            t0 = time.perf_counter()
-            units_to_process = self._get_units_due(game_state, current_frame)
-            if units_to_process:
-                result['units'] = self._process_micro_batch(
-                    game_state, units_to_process, current_frame
-                )
-            if result['units']:
-                self.latency_stats['micro'].append(time.perf_counter() - t0)
+            try:
+                t0 = time.perf_counter()
+                units_to_process = self._get_units_due(game_state, current_frame)
+                if units_to_process:
+                    result['units'] = self._process_micro_batch(
+                        game_state, units_to_process, current_frame
+                    )
+                if result['units']:
+                    self.latency_stats['micro'].append(time.perf_counter() - t0)
+            except Exception as e:
+                logger.error(f"Micro inference failed: {e}")
+                result['units'] = []
 
         return result
+
+    def _default_strategic(self) -> Dict:
+        """Return default strategic recommendation when inference fails."""
+        return {
+            'priority_economy': 0.25,
+            'priority_defense': 0.15,
+            'priority_military': 0.45,
+            'priority_tech': 0.15,
+            'prefer_infantry': 0.33,
+            'prefer_vehicles': 0.34,
+            'prefer_aircraft': 0.33,
+            'aggression': 0.5,
+            'target_player': -1,
+        }
 
     def _process_strategic(self, game_state: Dict) -> Dict:
         """Process strategic layer inference."""
@@ -169,7 +200,13 @@ class HierarchicalCoordinator:
         due_teams = []
 
         for team_id_str, team_data in teams.items():
-            team_id = int(team_id_str)
+            # FIX: Safe int conversion to handle malformed data
+            try:
+                team_id = int(team_id_str)
+            except (ValueError, TypeError):
+                logger.warning(f"Invalid team ID: {team_id_str}")
+                continue
+
             last_frame = self.last_tactical_frame.get(team_id, 0)
 
             if current_frame - last_frame >= self.config.tactical_interval:
@@ -218,7 +255,12 @@ class HierarchicalCoordinator:
         due_units = []
 
         for unit_id_str, unit_data in units.items():
-            unit_id = int(unit_id_str)
+            # FIX: Safe int conversion to handle malformed data
+            try:
+                unit_id = int(unit_id_str)
+            except (ValueError, TypeError):
+                logger.warning(f"Invalid unit ID: {unit_id_str}")
+                continue
 
             # Only process units in combat
             if not self._should_micro_unit(unit_data):
@@ -304,6 +346,19 @@ class HierarchicalCoordinator:
         for uid in stale_units:
             self.last_micro_frame.pop(uid, None)
             self.micro_hidden_states.pop(uid, None)
+
+        # FIX: Also limit total hidden states to prevent unbounded growth
+        max_hidden_states = 256
+        if len(self.micro_hidden_states) > max_hidden_states:
+            # Remove oldest entries (those with lowest last_micro_frame values)
+            sorted_units = sorted(
+                self.last_micro_frame.items(),
+                key=lambda x: x[1]
+            )
+            units_to_remove = sorted_units[:len(self.micro_hidden_states) - max_hidden_states]
+            for uid, _ in units_to_remove:
+                self.micro_hidden_states.pop(uid, None)
+                self.last_micro_frame.pop(uid, None)
 
     def get_latency_stats(self) -> Dict[str, Dict]:
         """Get latency statistics for each layer."""

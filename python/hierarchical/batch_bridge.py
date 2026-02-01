@@ -11,11 +11,24 @@ This reduces pipe communication overhead by combining messages.
 """
 
 import json
-from typing import Dict, List, Optional, Tuple
+import math
+from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass
 import numpy as np
 
 from training.config import PROTOCOL_VERSION
+
+
+def _sanitize_value(value: Any) -> Any:
+    """Replace NaN/Inf with safe defaults for JSON serialization."""
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            return 0.5  # Safe default
+    elif isinstance(value, dict):
+        return {k: _sanitize_value(v) for k, v in value.items()}
+    elif isinstance(value, list):
+        return [_sanitize_value(v) for v in value]
+    return value
 
 
 @dataclass
@@ -159,6 +172,7 @@ class BatchedMLBridge:
             ]
         }
         """
+        # FIX: Sanitize all values to prevent NaN/Inf serialization crashes
         response = {
             'frame': frame,
             'version': self.version,
@@ -167,16 +181,16 @@ class BatchedMLBridge:
                 'tactical': self.tactical_enabled,
                 'micro': self.micro_enabled,
             },
-            'strategic': strategic,
+            'strategic': _sanitize_value(strategic),
         }
 
         # Only include teams/units if present
         if teams:
-            response['teams'] = teams
+            response['teams'] = _sanitize_value(teams)
             self.total_teams_processed += len(teams)
 
         if units:
-            response['units'] = units
+            response['units'] = _sanitize_value(units)
             self.total_units_processed += len(units)
 
         return json.dumps(response, separators=(',', ':'))  # Compact JSON

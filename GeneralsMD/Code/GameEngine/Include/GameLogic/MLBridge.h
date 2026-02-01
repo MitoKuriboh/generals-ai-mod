@@ -242,6 +242,9 @@ public:
 	// Check if batched response is available
 	Bool hasBatchedResponse() const { return m_hasBatchedResponse; }
 
+	// Clear batched response flag after processing to prevent re-execution
+	void clearBatchedResponse() { m_hasBatchedResponse = false; }
+
 	// Check if we have a pending recommendation
 	Bool hasRecommendation() const { return m_hasRecommendation; }
 

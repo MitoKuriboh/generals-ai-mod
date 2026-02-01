@@ -305,9 +305,25 @@ void buildTacticalState(
     // Distance to base
     if (player && teamPos)
     {
-        // Get player's command center position
+        // FIX: Get actual base position from player's command center
         Coord3D basePos = { 0, 0, 0 };
-        // TODO: Get actual base position from player
+        Bool foundBase = false;
+
+        for (Object* obj = TheGameLogic->getFirstObject(); obj; obj = obj->getNextObject())
+        {
+            if (obj->getControllingPlayer() != player) continue;
+            if (obj->isKindOf(KINDOF_COMMANDCENTER) && !obj->isEffectivelyDead())
+            {
+                const Coord3D* pos = obj->getPosition();
+                if (pos)
+                {
+                    basePos = *pos;
+                    foundBase = true;
+                    break;
+                }
+            }
+        }
+
         Real dx = teamPos->x - basePos.x;
         Real dy = teamPos->y - basePos.y;
         Real dist = sqrtf(dx * dx + dy * dy);

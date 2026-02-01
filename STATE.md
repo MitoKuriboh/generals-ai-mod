@@ -1429,3 +1429,96 @@ python -m servers.hierarchical_server \
 3. **Fallback test:**
    - Use old server without capabilities field
    - Verify: Game doesn't crash, batched mode stays disabled
+
+## Hierarchical RL Comprehensive Audit Round 2 (Feb 1, 2026)
+
+**Major Discovery:** The batched protocol was scaffolded but NOT implemented. C++ had methods to send batched requests but NEVER called them. All tactical/micro inference was dead code until this audit.
+
+### CRITICAL Fixes Applied
+
+| # | Issue | Location | Fix |
+|---|-------|----------|-----|
+| 1 | **No batched requests ever sent** | AILearningPlayer.cpp:192 | Modified `exportStateToML()` to check `isBatchedModeEnabled()` and call `sendBatchedState()` |
+| 2 | **No format decision logic** | AILearningPlayer.cpp:184-193 | Added batched mode check before sending state |
+| 3 | **Teams/units never collected** | Missing from update() | Added `collectTeamsForBatch()` and `collectUnitsForBatch()` helper functions |
+| 4 | **Response flag never cleared** | AILearningPlayer.cpp:912-938 | Added `clearBatchedResponse()` to MLBridge, called after processing in update() |
+| 5 | **Python inference unhandled exceptions** | coordinator.py:166 | Wrapped all inference in try-catch with error logging and default fallbacks |
+| 6 | **Micro layer None crash** | coordinator.py:269 | Added proper None check before micro processing |
+| 7 | **JSON NaN/Inf serialization** | batch_bridge.py:182 | Added `_sanitize_value()` helper that replaces NaN/Inf with 0.5 |
+| 8 | **basePos hardcoded to (0,0,0)** | TacticalState.cpp:310 | Now iterates to find actual command center position |
+
+### HIGH Priority Fixes Applied
+
+| # | Issue | Location | Fix |
+|---|-------|----------|-----|
+| 9 | Unit tracking sets lastMicroFrame=0 | AILearningPlayer.cpp:1042 | Changed to `TheGameLogic->getFrame()` |
+| 10 | Unsafe int(team_id_str) conversion | coordinator.py:172,220 | Added try-except with warning log |
+| 11 | Unbounded micro hidden state growth | coordinator.py:278 | Added max_hidden_states=256 limit with LRU eviction |
+| 12 | No action value bounds checking | tactical/model.py, micro/model.py | Added `_sanitize_float()` with NaN/Inf handling and clamping |
+
+### New C++ Functions Added
+
+| Function | File | Purpose |
+|----------|------|---------|
+| `collectTeamsForBatch()` | AILearningPlayer.cpp | Collects teams needing tactical updates into batched request |
+| `collectUnitsForBatch()` | AILearningPlayer.cpp | Collects units needing micro updates into batched request |
+| `shouldMicroUnit()` | AILearningPlayer.cpp | Determines if a unit should receive micro control |
+| `clearBatchedResponse()` | MLBridge.h | Clears response flag after processing |
+
+### Files Modified
+
+**C++ (requires rebuild):**
+- `AILearningPlayer.h`: Added `collectTeamsForBatch()`, `collectUnitsForBatch()`, `shouldMicroUnit()` declarations
+- `AILearningPlayer.cpp`: Implemented batched sending, helper functions, response clearing, fixed unit tracking init
+- `MLBridge.h`: Added `clearBatchedResponse()` method
+- `TacticalState.cpp`: Fixed basePos calculation to use actual command center
+
+**Python:**
+- `hierarchical/coordinator.py`: Added try-catch around all inference, safe int conversion, hidden state limit
+- `hierarchical/batch_bridge.py`: Added `_sanitize_value()` function for NaN/Inf handling
+- `tactical/model.py`: Added `_sanitize_float()` and action bounds checking
+- `micro/model.py`: Added `_sanitize_float()` and action bounds checking
+
+### Verification
+
+After rebuilding the game:
+
+1. **Start hierarchical server:**
+   ```bash
+   python -m servers.hierarchical_server \
+     --strategic checkpoints/best_agent.pt \
+     --tactical checkpoints/tactical/tactical_best.pt \
+     --micro checkpoints/micro/micro_best.pt
+   ```
+
+2. **Start skirmish with Learning AI**
+
+3. **Check C++ log for:**
+   - `"MLBridge batched: frame=X teams=N units=M"` with N,M > 0
+
+4. **Check Python server log for:**
+   - `tactical_inferences > 0`
+   - `micro_inferences > 0`
+
+### Success Criteria
+
+| Criterion | Status |
+|-----------|--------|
+| Batched requests sent with teams > 0 | ⬜ Verify after rebuild |
+| Batched requests sent with units > 0 | ⬜ Verify after rebuild |
+| Server logs show tactical inferences | ⬜ Verify after rebuild |
+| Server logs show micro inferences | ⬜ Verify after rebuild |
+| Commands execute only once per response | ✅ Response flag cleared |
+| No crashes on model failures | ✅ Try-catch added |
+| Game plays without crashes | ⬜ Verify after rebuild |
+
+### Build Instructions
+
+```powershell
+# Windows - Visual Studio Developer Command Prompt
+cd C:\dev\generals\GeneralsMD\Code\GameEngine
+cmake --build build --config Release
+
+# Deploy to Steam
+scripts\deploy.bat
+```

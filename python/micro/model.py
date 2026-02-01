@@ -312,15 +312,26 @@ class MicroNetwork(nn.Module):
         return model
 
 
+def _sanitize_float(x, default: float = 0.0, min_val: float = -np.pi, max_val: float = np.pi) -> float:
+    """Sanitize float value, replacing NaN/Inf with default."""
+    import math
+    val = float(x.item()) if hasattr(x, 'item') else float(x)
+    if math.isnan(val) or math.isinf(val):
+        return default
+    return max(min_val, min(max_val, val))
+
+
 def action_dict_to_command(action_dict: Dict[str, torch.Tensor]) -> Dict[str, float]:
     """Convert action dict to JSON-serializable command."""
-    def to_float(x):
-        return float(x.item()) if hasattr(x, 'item') else float(x)
+    action_val = action_dict['action']
+    action_int = int(action_val.item()) if hasattr(action_val, 'item') else int(action_val)
+    # Clamp to valid action range
+    action_int = max(0, min(MICRO_ACTION_DIM - 1, action_int))
 
     return {
-        'action': int(action_dict['action'].item()) if hasattr(action_dict['action'], 'item') else int(action_dict['action']),
-        'move_angle': to_float(action_dict['move_angle']),
-        'move_distance': to_float(action_dict['move_distance']),
+        'action': action_int,
+        'move_angle': _sanitize_float(action_dict['move_angle'], 0.0, -np.pi, np.pi),
+        'move_distance': _sanitize_float(action_dict['move_distance'], 0.0, 0.0, 1.0),
     }
 
 

@@ -173,6 +173,15 @@ private:
 	// Execute micro command on a unit
 	void executeMicroCommand(Object* unit, const MicroCommand& cmd);
 
+	// Collect teams that need tactical updates for batched request
+	void collectTeamsForBatch(MLBatchedRequest& request);
+
+	// Collect units that need micro updates for batched request
+	void collectUnitsForBatch(MLBatchedRequest& request);
+
+	// Check if a unit should receive micro control
+	Bool shouldMicroUnit(Object* unit);
+
 	// Check if a team needs tactical update this frame
 	Bool teamNeedsTacticalUpdate(Team* team);
 

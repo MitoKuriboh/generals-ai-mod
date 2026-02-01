@@ -267,13 +267,27 @@ class TacticalNetwork(nn.Module):
         return model
 
 
+def _sanitize_float(x, default: float = 0.5) -> float:
+    """Sanitize float value, replacing NaN/Inf with default."""
+    import math
+    val = float(x.item()) if hasattr(x, 'item') else float(x)
+    if math.isnan(val) or math.isinf(val):
+        return default
+    return max(0.0, min(1.0, val))  # Clamp to [0, 1]
+
+
 def action_dict_to_command(action_dict: Dict[str, torch.Tensor]) -> Dict[str, float]:
     """Convert action dict to JSON-serializable command."""
+    action_val = action_dict['action']
+    action_int = int(action_val.item()) if hasattr(action_val, 'item') else int(action_val)
+    # Clamp to valid action range
+    action_int = max(0, min(TACTICAL_ACTION_DIM - 1, action_int))
+
     return {
-        'action': int(action_dict['action'].item()) if hasattr(action_dict['action'], 'item') else int(action_dict['action']),
-        'target_x': float(action_dict['target_x'].item()) if hasattr(action_dict['target_x'], 'item') else float(action_dict['target_x']),
-        'target_y': float(action_dict['target_y'].item()) if hasattr(action_dict['target_y'], 'item') else float(action_dict['target_y']),
-        'attitude': float(action_dict['attitude'].item()) if hasattr(action_dict['attitude'], 'item') else float(action_dict['attitude']),
+        'action': action_int,
+        'target_x': _sanitize_float(action_dict['target_x'], 0.5),
+        'target_y': _sanitize_float(action_dict['target_y'], 0.5),
+        'attitude': _sanitize_float(action_dict['attitude'], 0.5),
     }
 
 

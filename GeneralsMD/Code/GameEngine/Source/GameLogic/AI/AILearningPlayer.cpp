@@ -144,6 +144,11 @@ void AILearningPlayer::update()
 		processMicroControl();
 	}
 
+	// Clear batched response after processing to prevent re-execution
+	if (m_mlBridge.hasBatchedResponse()) {
+		m_mlBridge.clearBatchedResponse();
+	}
+
 	// Run normal skirmish AI
 	AISkirmishPlayer::update();
 }
@@ -186,14 +191,49 @@ void AILearningPlayer::exportStateToML()
 	MLGameState state;
 	buildGameState(state);
 
-	ML_LOG(("MLState: frame=%d player=%d money=%.2f\n",
-		m_frameCounter, state.playerIndex, state.money));
+	// Check if batched mode is enabled (server declared hierarchical capability)
+	if (m_mlBridge.isBatchedModeEnabled()) {
+		// Build batched request with all layers
+		MLBatchedRequest request;
+		request.clear();
+		request.frame = TheGameLogic->getFrame();
+		request.playerIndex = m_player->getPlayerIndex();
+		request.strategic = state;
 
-	m_mlBridge.sendState(state);
+		// Collect teams that need tactical updates
+		collectTeamsForBatch(request);
+
+		// Collect units that need micro updates
+		collectUnitsForBatch(request);
+
+		// Send batched request
+		m_mlBridge.sendBatchedState(request);
+
+		ML_LOG(("MLBridge batched: frame=%u teams=%d units=%d\n",
+			request.frame, request.numTeams, request.numUnits));
+	} else {
+		// Legacy format for strategic-only servers
+		ML_LOG(("MLState: frame=%d player=%d money=%.2f\n",
+			m_frameCounter, state.playerIndex, state.money));
+
+		m_mlBridge.sendState(state);
+	}
 }
 
 void AILearningPlayer::processMLRecommendations()
 {
+	// Try batched response first if batched mode enabled
+	if (m_mlBridge.isBatchedModeEnabled()) {
+		MLBatchedResponse response;
+		if (m_mlBridge.receiveBatchedResponse(response)) {
+			m_currentRecommendation = response.strategic;
+			ML_LOG(("MLBridge batched response: aggr=%.2f teams=%d units=%d\n",
+				response.strategic.aggression, response.numTeamCommands, response.numUnitCommands));
+			return;
+		}
+	}
+
+	// Fall back to legacy format
 	MLRecommendation rec;
 	if (m_mlBridge.receiveRecommendation(rec)) {
 		m_currentRecommendation = rec;
@@ -206,6 +246,111 @@ void AILearningPlayer::processMLRecommendations()
 			ML_LOG(("MLBridge: Recommendation stale, using parent AI logic\n"));
 		}
 	}
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
+// BATCHED REQUEST COLLECTION
+///////////////////////////////////////////////////////////////////////////////////////////////////
+
+void AILearningPlayer::collectTeamsForBatch(MLBatchedRequest& request)
+{
+	if (!m_player) return;
+
+	// Iterate through player's teams
+	for (Team* team = TheTeamFactory->getFirstTeam(); team; team = team->getNext()) {
+		// Check if team belongs to our player
+		if (team->getControllingPlayer() != m_player) continue;
+
+		// Check if team needs tactical update
+		if (!teamNeedsTacticalUpdate(team)) continue;
+
+		// Build tactical state for this team
+		TacticalState state;
+		buildTeamTacticalState(team, state);
+
+		// Add to batch
+		m_mlBridge.addTeamToBatch(request, team->getID(), state);
+
+		// Limit teams per batch
+		if (request.numTeams >= MAX_TEAMS_PER_BATCH) break;
+	}
+}
+
+void AILearningPlayer::collectUnitsForBatch(MLBatchedRequest& request)
+{
+	if (!m_player) return;
+
+	// Iterate units in combat or needing micro control
+	for (Object* obj = TheGameLogic->getFirstObject(); obj; obj = obj->getNextObject()) {
+		if (obj->getControllingPlayer() != m_player) continue;
+		if (obj->isEffectivelyDead()) continue;
+		if (!shouldMicroUnit(obj)) continue;
+		if (!unitNeedsMicroUpdate(obj)) continue;
+
+		// Build micro state for this unit
+		MicroState state;
+		buildUnitMicroState(obj, state);
+
+		// Add to batch
+		m_mlBridge.addUnitToBatch(request, obj->getID(), state);
+
+		// Limit units per batch
+		if (request.numUnits >= MAX_UNITS_PER_BATCH) break;
+	}
+}
+
+Bool AILearningPlayer::shouldMicroUnit(Object* unit)
+{
+	if (!unit) return false;
+	if (unit->isEffectivelyDead()) return false;
+
+	// Only micro combat-capable units
+	if (!unit->isKindOf(KINDOF_CAN_ATTACK)) return false;
+
+	// Don't micro structures
+	if (unit->isKindOf(KINDOF_STRUCTURE)) return false;
+
+	// Check if unit is in combat (has a target or under fire)
+	AIUpdateInterface* ai = unit->getAIUpdateInterface();
+	if (ai) {
+		Object* victim = ai->getCurrentVictim();
+		if (victim) return true;  // Actively attacking
+	}
+
+	// Check if recently damaged (under fire)
+	const BodyModuleInterface* body = unit->getBodyModule();
+	if (body) {
+		UnsignedInt lastDamageFrame = body->getLastDamageTimestamp();
+		UnsignedInt currentFrame = TheGameLogic->getFrame();
+		// In combat if damaged within last 2 seconds (60 frames)
+		if (currentFrame - lastDamageFrame < 60) return true;
+	}
+
+	// Check for nearby enemies
+	const Coord3D* unitPos = unit->getPosition();
+	if (unitPos) {
+		// Simple proximity check - if enemies within 300 units, micro this unit
+		for (Object* other = TheGameLogic->getFirstObject(); other; other = other->getNextObject()) {
+			if (other == unit) continue;
+			if (other->isEffectivelyDead()) continue;
+			if (other->getControllingPlayer() == m_player) continue;
+
+			Player* otherPlayer = other->getControllingPlayer();
+			if (!otherPlayer) continue;
+			if (m_player->getRelationship(otherPlayer->getDefaultTeam()) != ENEMIES) continue;
+
+			const Coord3D* otherPos = other->getPosition();
+			if (!otherPos) continue;
+
+			Real dx = otherPos->x - unitPos->x;
+			Real dy = otherPos->y - unitPos->y;
+			Real distSq = dx * dx + dy * dy;
+
+			if (distSq < 300.0f * 300.0f) return true;  // Enemy within 300 units
+		}
+	}
+
+	return false;
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1039,7 +1184,8 @@ Bool AILearningPlayer::unitNeedsMicroUpdate(Object* unit)
 
 		trackIdx = m_trackedUnitCount++;
 		m_trackedUnitIds[trackIdx] = unitId;
-		m_lastMicroFrame[trackIdx] = 0;
+		// FIX: Initialize to current frame to prevent immediate trigger
+		m_lastMicroFrame[trackIdx] = TheGameLogic->getFrame();
 	}
 
 	UnsignedInt lastFrame = m_lastMicroFrame[trackIdx];
