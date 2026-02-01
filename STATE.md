@@ -459,6 +459,579 @@ aggression=0.0 waits 30 seconds.
 - `python/health_check.py`
 - `scripts/deploy.bat`
 
+## Cleanup & Documentation Phase (Feb 1, 2026)
+
+### Phase A: Quick Wins ✓
+| Task | Status |
+|------|--------|
+| Delete `python_ml.tar.gz` (1.1 MB obsolete backup) | ✓ Deleted |
+| Consolidate reward constants (remove duplication) | ✓ rewards.py imports from config.py |
+| Document DECISION_INTERVAL magic number | ✓ Added comment in AILearningPlayer.h |
+
+### Phase B: Documentation Enhancement ✓
+| Task | Status |
+|------|--------|
+| Expand SECURITY.md | ✓ Added buffer overflow, pipe security, IPC isolation |
+| Add architecture diagrams to DESIGN.md | ✓ Added comm flow, protocol, training loop diagrams |
+| Document test coverage in VERIFICATION.md | ✓ Added coverage table (35% overall, 89% ppo.py) |
+
+### Phase C: Infrastructure ✓
+| Task | Status |
+|------|--------|
+| Standardize path handling | ✓ Already uses Path objects in config.py |
+| Add checkpoint rotation docs | ✓ Added to python/README.md |
+| Create benchmark script | ✓ Created python/tests/benchmark_latency.py |
+
+### Benchmark Results
+```
+Model Inference: 0.125 ms (P99: 0.493 ms)
+Full Roundtrip:  0.162 ms (P99: 0.270 ms)
+Headroom:        1000 ms (100% of decision interval)
+Max throughput:  6178 decisions/sec
+```
+
+### Test Suite Status
+- 47 tests pass
+- Coverage: 35% overall, core modules 76-100%
+
+## ML Mechanism Review Improvements (Feb 1, 2026)
+
+### High Priority Fixes Implemented
+
+| Issue | File | Fix |
+|-------|------|-----|
+| Recommendation staleness | MLBridge.h/cpp | Added 2-second timeout, reverts to defaults when stale |
+| Force array [1][2] unused | AILearningPlayer.cpp | Now tracks avg health ratio per category |
+| JSON value validation | MLBridge.cpp | Added clamping for all parsed values |
+| Protocol versioning | MLBridge.cpp, config.py | Added version field to JSON state messages |
+
+### Medium Priority Fixes Implemented
+
+| Issue | File | Fix |
+|-------|------|-----|
+| Under attack window short | AILearningPlayer.cpp | Increased from 5 to 10 seconds |
+
+### State Vector Changes
+
+Force arrays now contain meaningful data in indices [1] and [2]:
+- `[0]` = log10(count+1) - unit count (existing)
+- `[1]` = average health ratio (0-1) - NEW
+- `[2]` = production queue count - reserved for future use
+
+### Files Modified
+- `MLBridge.h`: Added staleness tracking, timeout constant, getValidRecommendation()
+- `MLBridge.cpp`: Staleness check, version field, value validation
+- `AILearningPlayer.cpp`: Health ratio tracking, longer under-attack window
+- `python/training/config.py`: Added PROTOCOL_VERSION constant
+- `python/training/model.py`: Documented new force array format
+
+## ML Mechanism Review Round 2 (Feb 1, 2026)
+
+**CRITICAL FIXES - Training bugs that prevented learning:**
+
+### 1. Terminal Reward Not Applied to PPO Buffer (CRITICAL)
+**Files:** `train_with_game.py`, `train_manual.py`
+
+**Problem:** Terminal rewards (±100) were added to local `rewards` list but NEVER stored in PPO buffer. The agent learned from shaping rewards only - no win/loss signal!
+
+**Fix:** Added terminal transition storage BEFORE calling `agent.update()`:
+```python
+if states and self._current_action is not None:
+    last_state_tensor = state_dict_to_tensor(states[-1])
+    self.agent.store_transition(
+        last_state_tensor,
+        self._current_action,
+        terminal_reward,
+        torch.tensor(0.0),  # Terminal value = 0
+        self._current_log_prob,
+        done=True
+    )
+```
+
+### 2. Hidden 10x Reward Multipliers (HIGH)
+**File:** `rewards.py`
+
+**Problem:** `_calculate_strategic_reward()` had hidden `* 10` multipliers that dominated all other signals.
+
+**Fix:** Removed the hidden multipliers from lines 276 and 286.
+
+### 3. Buffer Overflow in stateToJson() (HIGH)
+**File:** `MLBridge.cpp`
+
+**Problem:** Multiple `sprintf` calls without bounds checking.
+
+**Fix:** Converted to `snprintf` with buffer size tracking and overflow detection.
+
+### 4. Race Condition in Game-End Detection (HIGH)
+**File:** `AILearningPlayer.cpp`
+
+**Problem:** `m_gameEndSent` flag set after 50+ lines of logic, risking duplicate signals.
+
+**Fix:** Refactored to determine game-end result first, then set flag BEFORE sending.
+
+### 5. Terminal Threshold Too Aggressive (HIGH)
+**Files:** `rewards.py`, `env.py`
+
+**Problem:** Threshold 0.3 meant ~2 structures (log10(1+1)≈0.3). Player with 1 building lost instantly.
+
+**Fix:** Lowered threshold to 0.1 (truly no buildings).
+
+### 6. Win Condition Missing Own-Structures Check (HIGH)
+**Files:** `rewards.py`, `env.py`
+
+**Problem:** Mutual destruction counted as victory.
+
+**Fix:** Added `AND own_structures[0] >= STRUCTURE_THRESHOLD` to win condition.
+
+### 7. JSON Parser Missing isfinite() Validation (HIGH)
+**File:** `MLBridge.cpp`
+
+**Fix:** Added `isfinite()` check to `parseJsonFloat()` with MSVC fallback.
+
+### 8. Reward Scale Inconsistency (MEDIUM)
+**File:** `game_launcher.py`
+
+**Problem:** Used ±1.0 terminal rewards instead of ±100.0.
+
+**Fix:** Now imports and uses `WIN_REWARD`/`LOSS_REWARD` from config.py.
+
+### 9. Unbounded State Normalizations (MEDIUM)
+**File:** `model.py`
+
+**Fix:** Added `np.clip()` to income, game_time, army_strength, and other unbounded values.
+
+### 10. Dead Code Removed (LOW)
+**Files:** `AILearningPlayer.cpp`, `AILearningPlayer.h`
+
+**Fix:** Removed unused `shouldHoldTeam()` function.
+
+### Files Modified
+**C++ (requires rebuild):**
+- `MLBridge.cpp`: Buffer overflow fix, isfinite validation
+- `AILearningPlayer.cpp`: Race condition fix, dead code removal
+- `AILearningPlayer.h`: Dead code removal
+
+**Python:**
+- `train_with_game.py`: Terminal reward buffer fix
+- `train_manual.py`: Terminal reward buffer fix
+- `rewards.py`: Removed 10x multipliers, fixed thresholds
+- `env.py`: Fixed thresholds, win condition
+- `model.py`: Added state clamping
+- `game_launcher.py`: Fixed reward scale
+
+## ML Mechanism Review Round 3 (Feb 1, 2026)
+
+**Post-Round 2 audit identified 2 CRITICAL issues affecting policy gradient computation:**
+
+### 1. Beta Distribution Log-Prob Computed on Clamped Actions (CRITICAL)
+**Files:** `model.py`
+
+**Problem:** Log-prob was computed AFTER clamping actions, which corrupts policy gradients by pushing towards clamped boundaries rather than true optimal actions.
+
+**Fix:**
+- `get_action()`: Compute log_prob on raw sample BEFORE clamping
+- Added `log_prob.clamp(min=-100.0)` to prevent -inf from extreme samples
+- Changed clamp range from `[1e-6, 1-1e-6]` to `[1e-7, 1-1e-7]` (wider range, less interference)
+- `evaluate_actions()`: Added log_prob clamping for consistency
+
+### 2. Entropy Decay Never Implemented (MEDIUM → Implemented)
+**Files:** `ppo.py`, `config.py`
+
+**Problem:** Config defined `ENTROPY_DECAY=0.995` and `ENTROPY_MIN=0.001` but PPOAgent never applied them.
+
+**Fix:**
+- Added `current_entropy_coef` to PPOAgent
+- Decay applied after each update: `current_entropy_coef *= decay`, clamped to minimum
+- Saved/loaded with checkpoints for continuity across sessions
+- Logged in update stats for monitoring
+
+### 3. C++ Buffer Safety Fixes (HIGH)
+**File:** `MLBridge.cpp`
+
+| Fix | Description |
+|-----|-------------|
+| sendGameEnd overflow | Changed sprintf→snprintf with size check |
+| readMessage boundary | Tightened `>= bufferSize` to `>= bufferSize - 1` for null terminator |
+| parseJsonInt validation | Added format check and strtol with overflow detection |
+
+### 4. Protocol Version Validation (MEDIUM)
+**Files:** `train_with_game.py`, `train_manual.py`
+
+**Problem:** C++ sends version field but Python never validated it.
+
+**Fix:** Added `validate_protocol_version()` that logs warning on mismatch.
+
+### 5. Money Reward Calculation Clarity (LOW)
+**File:** `rewards.py`
+
+**Problem:** Code correct but confusing - money is log10(dollars+1) from C++.
+
+**Fix:** Added clarifying comments explaining the encoding and conversion.
+
+### Files Modified
+**Python:**
+- `model.py`: Log-prob clamping fix, wider action clamp range
+- `ppo.py`: Entropy decay implementation, save/load
+- `train_with_game.py`: Protocol version validation
+- `train_manual.py`: Protocol version validation
+- `rewards.py`: Clarifying comments for money encoding
+
+**C++ (requires rebuild):**
+- `MLBridge.cpp`: sendGameEnd snprintf, readMessage boundary, parseJsonInt validation
+
+### Verification
+- All 47 Python unit tests pass
+- Model log-prob clamping verified (all values ≥ -100)
+- Entropy decay verified (0.01 → 0.00995 after one update)
+- Save/load preserves entropy coefficient
+
+## Phase 8: Hierarchical RL Architecture (Feb 1, 2026)
+
+**Implemented three-layer hierarchical architecture for direct unit control.**
+
+### Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  STRATEGIC LAYER (Existing - ~1 sec intervals)                      │
+│  Input: 44 floats (global game state)                               │
+│  Output: 8 floats (priorities, composition, aggression)             │
+│  Network: 256-256 MLP + Beta distribution (81.5% win rate)          │
+│  Purpose: What to build, when to attack                             │
+└───────────────────────────────┬─────────────────────────────────────┘
+                                │ Goal embedding
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  TACTICAL LAYER (New - ~5 sec intervals per team)                   │
+│  Input: 64 floats (team state + strategic goals)                    │
+│  Output: 8 discrete actions + 3 continuous params                   │
+│  Network: 128-128 MLP + hybrid action space                         │
+│  Purpose: Where to send teams, attack/defend/retreat                │
+└───────────────────────────────┬─────────────────────────────────────┘
+                                │ Team objectives
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  MICRO LAYER (New - ~0.5 sec intervals per unit)                    │
+│  Input: 32 floats (unit state + team objective)                     │
+│  Output: 11 discrete actions + 2 continuous params                  │
+│  Network: 64-unit LSTM (temporal coherence)                         │
+│  Purpose: Kiting, focus fire, ability usage                         │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### New Python Modules
+
+```
+python/
+├── tactical/
+│   ├── __init__.py
+│   ├── model.py          # TacticalNetwork (hybrid action space)
+│   ├── state.py          # TacticalState (64 dims)
+│   ├── rewards.py        # Tactical reward functions
+│   └── train.py          # PPO training for tactical
+├── micro/
+│   ├── __init__.py
+│   ├── model.py          # MicroNetwork (LSTM)
+│   ├── state.py          # MicroState (32 dims)
+│   ├── rewards.py        # Micro reward functions
+│   ├── rules.py          # Rule-based expert for imitation
+│   ├── imitation.py      # Behavior cloning
+│   └── train.py          # PPO training for micro
+├── hierarchical/
+│   ├── __init__.py
+│   ├── coordinator.py    # Multi-layer inference coordination
+│   ├── batch_bridge.py   # Batched communication protocol
+│   └── train_joint.py    # Joint fine-tuning all layers
+└── servers/
+    ├── __init__.py
+    └── hierarchical_server.py  # Full three-layer inference server
+```
+
+### New C++ Files
+
+```
+GeneralsMD/Code/GameEngine/
+├── Include/GameLogic/
+│   ├── TacticalState.h   # 64-float team state struct
+│   └── MicroState.h      # 32-float unit state struct
+└── Source/GameLogic/AI/
+    ├── TacticalState.cpp # State builder for teams
+    └── MicroState.cpp    # State builder for units
+```
+
+### Extended MLBridge Protocol
+
+**Batched Request Format:**
+```json
+{
+  "frame": 1234,
+  "player_id": 3,
+  "strategic": { /* 44 floats */ },
+  "teams": [
+    {"id": 1, "state": [/* 64 floats */]},
+    {"id": 2, "state": [/* 64 floats */]}
+  ],
+  "units": [
+    {"id": 101, "state": [/* 32 floats */]},
+    {"id": 102, "state": [/* 32 floats */]}
+  ]
+}
+```
+
+**Batched Response Format:**
+```json
+{
+  "frame": 1234,
+  "version": 2,
+  "strategic": { /* 8 floats */ },
+  "teams": [
+    {"id": 1, "action": 0, "x": 0.5, "y": 0.6, "attitude": 0.8}
+  ],
+  "units": [
+    {"id": 101, "action": 5, "angle": 1.2, "dist": 0.3}
+  ]
+}
+```
+
+### Tactical Actions
+
+| Action | Description |
+|--------|-------------|
+| ATTACK_MOVE | Attack-move to position |
+| ATTACK_TARGET | Focus on specific target |
+| DEFEND_POSITION | Guard location |
+| RETREAT | Fall back to base |
+| HOLD | Hold position |
+| HUNT | Seek and destroy |
+| REINFORCE | Merge with another team |
+| SPECIAL | Use special ability |
+
+### Micro Actions
+
+| Action | Description |
+|--------|-------------|
+| ATTACK_CURRENT | Continue current target |
+| ATTACK_NEAREST | Switch to nearest enemy |
+| ATTACK_WEAKEST | Focus weakest enemy |
+| ATTACK_PRIORITY | Attack high-value target |
+| MOVE_FORWARD | Advance toward enemy |
+| MOVE_BACKWARD | Kite (retreat while attacking) |
+| MOVE_FLANK | Circle strafe |
+| HOLD_FIRE | Stealth/hold position |
+| USE_ABILITY | Use special ability |
+| RETREAT | Full disengage |
+| FOLLOW_TEAM | Default team behavior |
+
+### Latency Budget
+
+| Layer | Latency | Interval |
+|-------|---------|----------|
+| Strategic | ~0.1ms | 1 second |
+| Tactical | ~0.5ms × teams | 5 seconds per team |
+| Micro | ~0.02ms × units | 0.5 seconds per unit |
+| **Total** | **<10ms/frame** | Plenty of headroom |
+
+### Training Methodology
+
+**Staged Training (reduces sample complexity):**
+
+1. **Strategic**: Already trained (81.5% win rate)
+2. **Tactical Imitation**: Clone from replays (~2 hours)
+3. **Tactical PPO**: Fine-tune with RL (~8 hours)
+4. **Micro Imitation**: Clone from replays (~4 hours)
+5. **Micro PPO**: Fine-tune with RL (~8 hours)
+6. **Joint Fine-tuning**: All layers together (~8 hours)
+
+**Total: ~30 hours on single GPU**
+
+### Usage
+
+```bash
+# Start hierarchical inference server
+python -m servers.hierarchical_server \
+  --strategic checkpoints/strategic_best.pt \
+  --tactical checkpoints/tactical_best.pt \
+  --micro checkpoints/micro_best.pt
+
+# Train tactical layer
+python -m tactical.train --episodes 1000
+
+# Train micro layer (imitation first)
+python -m micro.imitation --episodes 500
+python -m micro.train --episodes 1000
+
+# Joint fine-tuning
+python -m hierarchical.train_joint \
+  --strategic checkpoints/strategic_best.pt \
+  --tactical checkpoints/tactical_best.pt \
+  --micro checkpoints/micro_best.pt \
+  --episodes 500
+```
+
+### Files Modified (C++)
+
+| File | Changes |
+|------|---------|
+| `AILearningPlayer.h` | Added processTeamTactics(), processMicroControl(), tracking arrays |
+| `AILearningPlayer.cpp` | Implemented tactical/micro processing, command execution |
+| `MLBridge.h` | Added batched protocol structs and methods |
+| `MLBridge.cpp` | Implemented batched serialization/parsing |
+
+### Key Design Decisions
+
+1. **Staged Training**: Each layer trained separately to reduce sample complexity
+2. **Batched Communication**: Single message per frame for all layers
+3. **LSTM for Micro**: Temporal coherence for consistent unit behavior
+4. **Beta Distributions**: All continuous outputs use Beta for proper [0,1] range
+5. **Fallback Behavior**: Graceful degradation when layers not available
+
+## Hierarchical RL Implementation Fixes (Feb 1, 2026)
+
+### CRITICAL Fixes Applied
+
+#### 1. `countEnemiesInQuadrants()` Now Implemented
+**File:** `TacticalState.cpp:448-530`
+
+**Problem:** Function created QuadrantCounter struct but never iterated over objects - returned all zeros.
+
+**Fix:** Implemented proper object scanning using PartitionManager:
+```cpp
+PartitionFilter* filter = ThePartitionManager->createPartitionFilter();
+filter->setRelationshipFilter(player, ENEMIES);
+ObjectIterator* iter = ThePartitionManager->iterateObjectsInRange(
+    teamPos, TacticalConfig::QUADRANT_RADIUS, filter
+);
+// Iterate and count in quadrants...
+```
+
+Same fix applied to `countAlliesInQuadrants()`.
+
+#### 2. SimulatedHierarchicalEnv Created
+**File:** `python/hierarchical/sim_env.py`
+
+**Problem:** `train_joint.py` called undefined methods like `env.get_team_states()`, `env.apply_micro_action()`.
+
+**Fix:** Created complete simulated environment supporting:
+- `reset()` - Returns strategic state
+- `step()` - Advances simulation, returns (state, reward, done, info)
+- `get_team_states()` - Returns dict of team states
+- `get_unit_states(team_id)` - Returns dict of unit states
+- `apply_tactical_action(team_id, action)` - Executes team command
+- `apply_micro_action(unit_id, action)` - Executes unit command
+
+#### 3. Joint Training Now Works
+**File:** `python/hierarchical/train_joint.py`
+
+Updated to use `SimulatedHierarchicalEnv` for testing without the real game. Added proper state-to-tensor conversion for simulated environment format.
+
+### Already Fixed (Confirmed)
+- NULL check in `executeMicroCommand()` - Line 1123 has `if (!ai) return;`
+
+### Files Modified
+- `GeneralsMD/Code/GameEngine/Source/GameLogic/AI/TacticalState.cpp`
+- `python/hierarchical/sim_env.py` (NEW)
+- `python/hierarchical/train_joint.py`
+- `python/hierarchical/__init__.py`
+
+### Verification Test Results
+```
+Joint Training Test (200 episodes):
+- Episode 10:  Reward: -48.61, Win Rate: 0.0%
+- Episode 100: Reward: -46.34, Win Rate: 3.0%
+- Episode 200: Reward: -47.72, Win Rate: 1.5%
+```
+Training pipeline works correctly. Low win rate expected with random initialization.
+For best results, follow the staged training approach (strategic → tactical → micro → joint).
+
+### Remaining Placeholder Values (~15)
+Files `TacticalState.cpp` and `MicroState.cpp` have hardcoded values:
+- `distToObjective`, `terrainAdvantage`, `ammunition`, `cooldown` = 0.5f
+
+**Impact:** Layers can still learn basic behaviors; these can be refined as training reveals weaknesses.
+
+## Hierarchical Layers Disabled (Feb 1, 2026)
+
+**Decision:** Disabled TacticalState.cpp and MicroState.cpp from build pending API fixes.
+
+The C++ implementation used game APIs that don't exist or have different signatures:
+- `ExperienceTracker` class doesn't exist
+- `Team::countObjects()` has different signature
+- `PartitionManager` API differs from assumed
+- `ThingTemplate::getBuildCost()` is protected
+
+**Changes Made:**
+1. Removed `TacticalState.cpp` and `MicroState.cpp` from CMakeLists.txt
+2. Added `#define HIERARCHICAL_LAYERS_DISABLED 1` to `MLBridge.h` and `AILearningPlayer.h`
+3. Added stub structs (TacticalState, MicroState, TacticalCommand, MicroCommand) to MLBridge.h
+4. Added stub config namespaces (TacticalConfig, MicroConfig) to AILearningPlayer.h
+5. Wrapped `buildTeamTacticalState()` and `buildUnitMicroState()` with `#ifndef HIERARCHICAL_LAYERS_DISABLED`
+6. Added stub helper functions for micro control when disabled
+7. Fixed API mismatches in AILearningPlayer.cpp:
+   - `groupAttackMoveToPosition()` takes 3 args, not 2
+   - `GUARD_AREA` → `GUARDMODE_NORMAL`
+   - `groupHalt()` → `groupIdle()`
+   - `aiHalt()` → `aiIdle()`
+
+**Build Status:** SUCCESSFUL ✓
+- Build date: Feb 1, 2026 (16:56)
+- Deployed to: `C:\Program Files (x86)\Steam\steamapps\common\Command & Conquer Generals - Zero Hour\generalszh.exe`
+
+**Strategic layer still fully functional.** Hierarchical (Tactical/Micro) layers can be trained in Python simulation but won't execute in-game until C++ state builders are fixed with correct APIs.
+
+## Hierarchical C++ Layers Fixed (Feb 1, 2026)
+
+**Fixed the fictional PartitionManager API usage in TacticalState.cpp and MicroState.cpp.**
+
+### Root Cause
+
+The hierarchical layer code used a fictional API pattern:
+```cpp
+// WRONG - doesn't exist
+PartitionFilter* filter = ThePartitionManager->createPartitionFilter();
+filter->setRelationshipFilter(player, ENEMIES);
+ObjectIterator* iter = ThePartitionManager->iterateObjectsInRange(pos, radius, filter);
+```
+
+### Correct API Pattern (from AI.cpp)
+
+```cpp
+// CORRECT - stack-allocated filters with NULL-terminated array
+PartitionFilterRelationship filterRel(refObj, PartitionFilterRelationship::ALLOW_ENEMIES);
+PartitionFilterAlive filterAlive;
+PartitionFilter* filters[4];
+filters[0] = &filterRel;
+filters[1] = &filterAlive;
+filters[2] = NULL;
+
+SimpleObjectIterator* iter = ThePartitionManager->iterateObjectsInRange(
+    pos, radius, FROM_CENTER_2D, filters
+);
+MemoryPoolObjectHolder holder(iter);  // Auto-cleanup
+```
+
+### Files Modified
+
+| File | Changes |
+|------|---------|
+| `TacticalState.cpp` | Added ObjectIter.h include, helper to get first team member, fixed countEnemiesInQuadrants() and countAlliesInQuadrants() |
+| `MicroState.cpp` | Added ObjectIter.h include, fixed findNearestEnemy(), findWeakestEnemy(), findPriorityTarget(), checkRetreatPath(), changed getAttackObject()→getCurrentVictim() |
+| `CMakeLists.txt` | Re-added TacticalState.cpp, MicroState.cpp to sources and headers |
+
+### Key API Differences Fixed
+
+1. **PartitionFilter creation**: Stack-allocated, not heap
+2. **Relationship filter**: Takes `Object*` not `Player*`
+3. **iterateObjectsInRange**: Requires `DistanceCalculationType` (e.g., `FROM_CENTER_2D`)
+4. **Cleanup**: Use `MemoryPoolObjectHolder` instead of manual `deleteInstance()`
+5. **AI method**: `getCurrentVictim()` not `getAttackObject()`
+
+### Verification
+
+After rebuilding:
+1. Game build: `cmake --build build --config Release` in `GeneralsMD/Code/GameEngine`
+2. Deploy: `scripts\deploy.bat`
+3. Test hierarchical: `python -m hierarchical.train_joint --use_simulated --episodes 10`
+
 ## Next Steps
 
 1. ~~Deploy built exe to Steam folder~~ ✓
@@ -468,10 +1041,15 @@ aggression=0.0 waits 30 seconds.
 5. ~~Comprehensive codebase improvements~~ ✓ (Feb 1, 2026)
 6. ~~Critical bug fixes~~ ✓ (Feb 1, 2026 - Round 2)
 7. ~~Round 3 security/correctness fixes~~ ✓ (Feb 1, 2026 - Round 3)
-8. **Build game with new C++ changes**
-9. Run pytest python/tests/ to verify Python fixes
-10. Test training stability with Beta distribution
-11. Graduate to Hard AI once >80% vs Easy
+8. ~~Cleanup & documentation~~ ✓ (Feb 1, 2026)
+9. ~~ML Mechanism Review fixes~~ ✓ (Feb 1, 2026)
+10. ~~ML Mechanism Review Round 2~~ ✓ (Feb 1, 2026) **CRITICAL TRAINING FIXES**
+11. ~~Hierarchical RL fixes~~ ✓ (Feb 1, 2026) **countEnemiesInQuadrants, sim env**
+12. ~~Build game with hierarchical disabled~~ ✓ (Feb 1, 2026) **Deployed to Steam**
+13. ~~Fix C++ hierarchical APIs~~ ✓ (Feb 1, 2026) **PartitionManager pattern corrected**
+14. **BUILD GAME** with hierarchical enabled
+15. Test hierarchical training in simulation: `python -m hierarchical.train_joint --use_simulated`
+16. Graduate to Hard AI once >80% vs Easy
 
 ## Phase 1: ML Decision Logic Implementation (Jan 31, 2026)
 

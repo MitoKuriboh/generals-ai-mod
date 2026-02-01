@@ -240,6 +240,8 @@ set(GAMEENGINE_SRC
     Include/GameLogic/AISkirmishPlayer.h
     Include/GameLogic/AILearningPlayer.h
     Include/GameLogic/MLBridge.h
+    Include/GameLogic/TacticalState.h
+    Include/GameLogic/MicroState.h
     Include/GameLogic/AIStateMachine.h
     Include/GameLogic/AITNGuard.h
     Include/GameLogic/Armor.h
@@ -843,6 +845,8 @@ set(GAMEENGINE_SRC
     Source/GameLogic/AI/AISkirmishPlayer.cpp
     Source/GameLogic/AI/AILearningPlayer.cpp
     Source/GameLogic/AI/MLBridge.cpp
+    Source/GameLogic/AI/TacticalState.cpp
+    Source/GameLogic/AI/MicroState.cpp
     Source/GameLogic/AI/AIStates.cpp
     Source/GameLogic/AI/AITNGuard.cpp
     Source/GameLogic/AI/Squad.cpp
