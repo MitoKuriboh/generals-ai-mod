@@ -81,3 +81,9 @@ python_ml.tar.gz
 
 # Logs
 *.log
+
+# Virtual environment
+.venv/
+
+# Archive files
+*.archive

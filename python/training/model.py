@@ -123,83 +123,6 @@ def action_tensor_to_dict(action: torch.Tensor) -> Dict:
     }
 
 
-class LegacyPolicyNetwork(nn.Module):
-    """
-    Legacy model architecture for loading old checkpoints.
-    Uses Gaussian distribution and 128 hidden units.
-    """
-
-    def __init__(self, state_dim: int = STATE_DIM, action_dim: int = TOTAL_ACTION_DIM,
-                 hidden_dim: int = 128):
-        super().__init__()
-
-        self.state_dim = state_dim
-        self.action_dim = action_dim
-
-        # Shared feature extractor (no LayerNorm in legacy)
-        self.shared = nn.Sequential(
-            nn.Linear(state_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-        )
-
-        # Actor head - Gaussian (legacy)
-        self.actor_mean = nn.Linear(hidden_dim, action_dim)
-        self.actor_log_std = nn.Parameter(torch.zeros(action_dim))
-
-        # Critic head
-        self.critic = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(),
-            nn.Linear(hidden_dim // 2, 1)
-        )
-
-    def forward(self, state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        features = self.shared(state)
-        mean = torch.sigmoid(self.actor_mean(features))  # Bounded [0,1]
-        std = self.actor_log_std.exp().expand_as(mean)
-        value = self.critic(features)
-        return mean, std, value
-
-    def get_action(self, state: torch.Tensor, deterministic: bool = False
-                   ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if state.dim() == 1:
-            state = state.unsqueeze(0)
-
-        mean, std, value = self.forward(state)
-
-        if deterministic:
-            action = mean
-            log_prob = torch.zeros(state.size(0), device=state.device)
-        else:
-            dist = torch.distributions.Normal(mean, std)
-            action = dist.sample()
-            action = action.clamp(0.0, 1.0)
-            log_prob = dist.log_prob(action).sum(dim=-1)
-
-        # FIX: Keep consistent 1D shapes for legacy model too
-        return action.view(-1), log_prob.view(1), value.view(1)
-
-    def evaluate_actions(self, states: torch.Tensor, actions: torch.Tensor
-                         ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        mean, std, values = self.forward(states)
-        dist = torch.distributions.Normal(mean, std)
-        log_probs = dist.log_prob(actions.clamp(1e-6, 1-1e-6)).sum(dim=-1)
-        entropy = dist.entropy().sum(dim=-1)
-        return log_probs, values.squeeze(-1), entropy
-
-    @classmethod
-    def load(cls, path: str) -> 'LegacyPolicyNetwork':
-        checkpoint = torch.load(path, map_location='cpu', weights_only=False)
-        model = cls()
-        if 'policy_state_dict' in checkpoint:
-            model.load_state_dict(checkpoint['policy_state_dict'])
-        elif 'state_dict' in checkpoint:
-            model.load_state_dict(checkpoint['state_dict'])
-        return model
-
-
 class PolicyNetwork(nn.Module):
     """
     Actor-Critic Policy Network for PPO.
@@ -352,33 +275,19 @@ class PolicyNetwork(nn.Module):
         }, path)
 
     @classmethod
-    def load(cls, path: str, allow_legacy: bool = True) -> 'PolicyNetwork':
-        """
-        Load model from file.
-
-        If the checkpoint is from a legacy architecture (Gaussian, 128 hidden),
-        returns a LegacyPolicyNetwork instead.
-        """
+    def load(cls, path: str) -> 'PolicyNetwork':
+        """Load model from file."""
         checkpoint = torch.load(path, map_location='cpu', weights_only=False)
 
-        # Detect legacy checkpoint format
         state_dict_key = 'policy_state_dict' if 'policy_state_dict' in checkpoint else 'state_dict'
         if state_dict_key not in checkpoint:
             raise KeyError(f"Checkpoint missing state_dict. Keys: {checkpoint.keys()}")
-
-        state_dict = checkpoint[state_dict_key]
-
-        # Legacy checkpoints have 'actor_log_std' and 'actor_mean' instead of 'actor_alpha'/'actor_beta'
-        is_legacy = 'actor_log_std' in state_dict or 'actor_mean.weight' in state_dict
-
-        if is_legacy and allow_legacy:
-            return LegacyPolicyNetwork.load(path)
 
         model = cls(
             state_dim=checkpoint.get('state_dim', STATE_DIM),
             action_dim=checkpoint.get('action_dim', TOTAL_ACTION_DIM)
         )
-        model.load_state_dict(state_dict)
+        model.load_state_dict(checkpoint[state_dict_key])
         return model
 
 

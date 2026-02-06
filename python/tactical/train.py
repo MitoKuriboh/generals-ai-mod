@@ -116,7 +116,8 @@ class TacticalRolloutBuffer:
         advantages = self.advantages
         returns = self.returns
 
-        minibatch_size = n // num_minibatches
+        # FIX P2: Ensure minibatch_size >= 1 to prevent infinite loop
+        minibatch_size = max(1, n // num_minibatches)
         for start in range(0, n, minibatch_size):
             end = min(start + minibatch_size, n)
             batch_indices = indices[start:end]
@@ -231,7 +232,8 @@ class TacticalPPOAgent:
                 )
 
                 # Policy loss
-                ratio = torch.exp(log_probs - old_log_probs)
+                # FIX P1: Clamp exp input to prevent overflow
+                ratio = torch.exp(torch.clamp(log_probs - old_log_probs, -20, 20))
                 clipped_ratio = torch.clamp(
                     ratio, 1 - self.config.clip_epsilon, 1 + self.config.clip_epsilon
                 )

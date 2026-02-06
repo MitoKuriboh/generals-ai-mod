@@ -25,6 +25,7 @@ from ..model import state_dict_to_tensor
 if sys.platform == 'win32':
     import win32pipe
     import win32file
+    import win32event
     import win32api
     import pywintypes
     HAS_WIN32 = True
@@ -67,7 +68,7 @@ class ManualTrainer(BaseTrainer):
             print(f"[Pipe] Created: {PIPE_NAME}")
             print(f"\nInstructions:")
             print(f"  1. Launch C&C Generals Zero Hour")
-            print(f"  2. Start Skirmish → Select Learning AI opponent")
+            print(f"  2. Start Skirmish -> Select Learning AI opponent")
             print(f"  3. Play the game (training happens automatically)")
             print(f"  4. When game ends, start another skirmish")
             print(f"  5. Press Ctrl+C to stop early\n")
@@ -99,7 +100,7 @@ class ManualTrainer(BaseTrainer):
         event_handle = None
         try:
             overlapped = pywintypes.OVERLAPPED()
-            event_handle = win32file.CreateEvent(None, True, False, None)
+            event_handle = win32event.CreateEvent(None, True, False, None)
             if event_handle is None:
                 print("[Error] Failed to create event handle")
                 return False
@@ -113,7 +114,7 @@ class ManualTrainer(BaseTrainer):
 
             # Wait (indefinitely if timeout is None)
             wait_time = int(timeout * 1000) if timeout else 0xFFFFFFFF  # INFINITE
-            result = win32file.WaitForSingleObject(overlapped.hEvent, wait_time)
+            result = win32event.WaitForSingleObject(overlapped.hEvent, wait_time)
 
             if result == 0:  # WAIT_OBJECT_0
                 self.connected = True

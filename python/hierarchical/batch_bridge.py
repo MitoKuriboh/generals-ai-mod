@@ -93,28 +93,38 @@ class BatchedMLBridge:
         """
         Parse batched request from game.
 
-        Expected format:
+        Supports both formats:
+        1. Batched format:
         {
             "frame": 1234,
             "player_id": 3,
             "strategic": { ... },
-            "teams": [
-                {"id": 1, "state": { ... }},
-                ...
-            ],
-            "units": [
-                {"id": 101, "state": { ... }},
-                ...
-            ]
+            "teams": [{"id": 1, "state": { ... }}, ...],
+            "units": [{"id": 101, "state": { ... }}, ...]
+        }
+
+        2. Flat format (backward compatible):
+        {
+            "frame": 1234,
+            "player_id": 3,
+            "money": ...,
+            "power": ...,
+            ...
         }
         """
         data = json.loads(json_str)
 
         frame = data.get('frame', 0)
-        player_id = data.get('player_id', 0)
+        player_id = data.get('player_id', data.get('player', 0))  # Support both 'player_id' and 'player'
 
-        # Parse strategic state
-        strategic_state = data.get('strategic', {})
+        # Parse strategic state - handle both batched and flat format
+        if 'strategic' in data:
+            # Batched format
+            strategic_state = data.get('strategic', {})
+        else:
+            # Flat format - entire data is strategic state (minus metadata keys)
+            strategic_state = {k: v for k, v in data.items()
+                              if k not in ('frame', 'player_id', 'teams', 'units', 'version')}
 
         # Parse team states
         team_states = {}
@@ -263,35 +273,53 @@ def validate_request(json_str: str) -> Tuple[bool, Optional[str]]:
     """
     Validate request JSON format.
 
+    Supports both:
+    - Old flat format: {frame, money, power, ...}
+    - New batched format: {frame, strategic: {...}, teams: [...], units: [...]}
+
     Returns:
         (is_valid, error_message)
     """
     try:
         data = json.loads(json_str)
 
-        # Check required fields
-        if 'strategic' not in data:
-            return False, "Missing 'strategic' field"
+        # Handle game_end messages
+        if data.get('type') == 'game_end':
+            return True, None
 
-        if 'frame' not in data:
-            return False, "Missing 'frame' field"
+        # FIX: Validate protocol version if present
+        version = data.get('version', PROTOCOL_VERSION)  # Default to expected version if not present
+        if version != PROTOCOL_VERSION:
+            # Log warning but don't fail - allows interop with slightly different versions
+            import logging
+            logging.getLogger(__name__).warning(
+                f"Protocol version mismatch: expected {PROTOCOL_VERSION}, got {version}"
+            )
 
-        # Validate strategic state
-        strategic = data['strategic']
-        required_strategic = ['money', 'power']
-        for field in required_strategic:
-            if field not in strategic:
-                return False, f"Missing strategic field: {field}"
+        # frame is optional in flat format (game doesn't always send it)
+        # Check for batched format (has 'strategic' key) or flat format (has 'money' at top level)
+        if 'strategic' in data:
+            # Batched format - validate nested strategic state
+            strategic = data['strategic']
+            required_strategic = ['money', 'power']
+            for field in required_strategic:
+                if field not in strategic:
+                    return False, f"Missing strategic field: {field}"
 
-        # Validate team states if present
-        for team_data in data.get('teams', []):
-            if 'id' not in team_data:
-                return False, "Team missing 'id' field"
+            # Validate team states if present
+            for team_data in data.get('teams', []):
+                if 'id' not in team_data:
+                    return False, "Team missing 'id' field"
 
-        # Validate unit states if present
-        for unit_data in data.get('units', []):
-            if 'id' not in unit_data:
-                return False, "Unit missing 'id' field"
+            # Validate unit states if present
+            for unit_data in data.get('units', []):
+                if 'id' not in unit_data:
+                    return False, "Unit missing 'id' field"
+        elif 'money' in data:
+            # Old flat format - strategic fields at top level
+            pass  # Valid old format
+        else:
+            return False, "Missing 'strategic' or 'money' field"
 
         return True, None
 

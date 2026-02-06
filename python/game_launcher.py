@@ -24,6 +24,7 @@ from enum import Enum
 if sys.platform == 'win32':
     import win32pipe
     import win32file
+    import win32api
     import pywintypes
 
 
@@ -92,21 +93,25 @@ class NamedPipeServer:
             overlapped.hEvent = win32file.CreateEvent(None, True, False, None)
 
             try:
-                win32pipe.ConnectNamedPipe(self.pipe, overlapped)
-            except pywintypes.error as e:
-                if e.args[0] != 997:  # ERROR_IO_PENDING
-                    raise
+                try:
+                    win32pipe.ConnectNamedPipe(self.pipe, overlapped)
+                except pywintypes.error as e:
+                    if e.args[0] != 997:  # ERROR_IO_PENDING
+                        raise
 
-            # Wait with timeout
-            result = win32file.WaitForSingleObject(overlapped.hEvent, int(timeout * 1000))
+                # Wait with timeout
+                result = win32file.WaitForSingleObject(overlapped.hEvent, int(timeout * 1000))
 
-            if result == 0:  # WAIT_OBJECT_0
-                self.connected = True
-                print("Game connected!")
-                return True
-            else:
-                print(f"Connection timeout (waited {timeout}s)")
-                return False
+                if result == 0:  # WAIT_OBJECT_0
+                    self.connected = True
+                    print("Game connected!")
+                    return True
+                else:
+                    print(f"Connection timeout (waited {timeout}s)")
+                    return False
+            finally:
+                # FIX: Always close event handle to prevent resource leak
+                win32api.CloseHandle(overlapped.hEvent)
 
         except pywintypes.error as e:
             print(f"Connection error: {e}")
@@ -179,7 +184,8 @@ class NamedPipeServer:
             try:
                 win32pipe.DisconnectNamedPipe(self.pipe)
                 win32file.CloseHandle(self.pipe)
-            except:
+            except pywintypes.error:
+                # Pipe may already be disconnected or closed
                 pass
             self.pipe = None
             self.connected = False
