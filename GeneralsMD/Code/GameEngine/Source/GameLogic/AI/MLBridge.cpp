@@ -207,12 +207,71 @@ void MLBridge::disconnect()
 	}
 	m_connected = false;
 	m_hasRecommendation = false;
+	// FIX I1: Reset recommendation frame on disconnect to allow immediate reconnect
+	m_lastRecommendationFrame = 0;
 	DEBUG_LOG(("MLBridge: Disconnected\n"));
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 // Trainer Process Launch
 ///////////////////////////////////////////////////////////////////////////////////////////////////
+
+// FIX: Helper to check if a file exists
+static Bool fileExists(const char* path)
+{
+	DWORD attrs = GetFileAttributesA(path);
+	return attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+// FIX: Helper to find Python executable in common locations
+static Bool findPythonExecutable(char* outPath, size_t outPathSize)
+{
+	// Try 'where python' to find Python in PATH
+	FILE* pipe = _popen("where python 2>nul", "r");
+	if (pipe) {
+		if (fgets(outPath, (int)outPathSize - 1, pipe)) {
+			// Remove newline
+			char* newline = strchr(outPath, '\n');
+			if (newline) *newline = '\0';
+			newline = strchr(outPath, '\r');
+			if (newline) *newline = '\0';
+
+			_pclose(pipe);
+			if (fileExists(outPath)) {
+				return true;
+			}
+		} else {
+			_pclose(pipe);
+		}
+	}
+
+	// Try common Python installation paths
+	const char* commonPaths[] = {
+		"C:\\Python39\\python.exe",
+		"C:\\Python310\\python.exe",
+		"C:\\Python311\\python.exe",
+		"C:\\Python312\\python.exe",
+		"C:\\Program Files\\Python39\\python.exe",
+		"C:\\Program Files\\Python310\\python.exe",
+		"C:\\Program Files\\Python311\\python.exe",
+		"C:\\Program Files\\Python312\\python.exe",
+		"C:\\Users\\Public\\python\\python.exe",
+		NULL
+	};
+
+	for (int i = 0; commonPaths[i]; i++) {
+		if (fileExists(commonPaths[i])) {
+			strncpy(outPath, commonPaths[i], outPathSize - 1);
+			outPath[outPathSize - 1] = '\0';
+			return true;
+		}
+	}
+
+	// Last resort: just use python.exe and hope it's in PATH
+	strncpy(outPath, "python.exe", outPathSize - 1);
+	outPath[outPathSize - 1] = '\0';
+	return true;  // Will fail later if not found
+}
 
 Bool MLBridge::launchTrainer()
 {
@@ -222,38 +281,91 @@ Bool MLBridge::launchTrainer()
 
 	m_trainerLaunched = true;  // Mark as attempted even if it fails
 
+	// FIX: Check GENERALS_AI_DIR environment variable first
+	char envDir[MAX_PATH];
+	DWORD envLen = GetEnvironmentVariableA("GENERALS_AI_DIR", envDir, MAX_PATH);
+
+	char scriptPath[MAX_PATH];
+	char workDir[MAX_PATH];
+	Bool found = false;
+
+	// Search order:
+	// 1. GENERALS_AI_DIR environment variable
+	// 2. Game directory / python
+	// 3. C:\Users\Public\generals-ai-mod\python (common install location)
+	// 4. C:\Users\Public\game-ai-agent\python (alternate location)
+
+	const char* searchDirs[5];
+	int numDirs = 0;
+
+	if (envLen > 0 && envLen < MAX_PATH) {
+		searchDirs[numDirs++] = envDir;
+	}
+
 	// Get the game's directory
 	char gameDir[MAX_PATH];
 	GetModuleFileNameA(NULL, gameDir, MAX_PATH);
-
-	// Remove executable name to get directory
 	char* lastSlash = strrchr(gameDir, '\\');
 	if (lastSlash) {
 		*lastSlash = '\0';
 	}
+	searchDirs[numDirs++] = gameDir;
 
-	// Build path to Python trainer script
-	// Expected location: <game_dir>/python/train_manual.py
-	char scriptPath[MAX_PATH];
-	int written = snprintf(scriptPath, sizeof(scriptPath), "%s\\python\\train_manual.py", gameDir);
-	if (written < 0 || written >= (int)sizeof(scriptPath)) {
-		DEBUG_LOG(("MLBridge: Script path too long\n"));
+	// Common installation locations
+	searchDirs[numDirs++] = "C:\\Users\\Public\\generals-ai-mod";
+	searchDirs[numDirs++] = "C:\\Users\\Public\\game-ai-agent";
+	searchDirs[numDirs] = NULL;
+
+	// Search for the script
+	for (int i = 0; i < numDirs && !found; i++) {
+		int written = snprintf(scriptPath, sizeof(scriptPath),
+			"%s\\python\\train_manual.py", searchDirs[i]);
+		if (written > 0 && written < (int)sizeof(scriptPath)) {
+			if (fileExists(scriptPath)) {
+				snprintf(workDir, sizeof(workDir), "%s\\python", searchDirs[i]);
+				found = true;
+				DEBUG_LOG(("MLBridge: Found trainer at %s\n", scriptPath));
+			}
+		}
+	}
+
+	if (!found) {
+		DEBUG_LOG(("MLBridge: Trainer script not found. Searched:\n"));
+		for (int i = 0; i < numDirs; i++) {
+			DEBUG_LOG(("  - %s\\python\\train_manual.py\n", searchDirs[i]));
+		}
+		DEBUG_LOG(("Set GENERALS_AI_DIR environment variable to fix.\n"));
 		return false;
 	}
 
-	// Check if script exists
-	DWORD attrs = GetFileAttributesA(scriptPath);
-	if (attrs == INVALID_FILE_ATTRIBUTES) {
-		DEBUG_LOG(("MLBridge: Trainer script not found at %s\n", scriptPath));
+	// FIX: Find Python executable
+	char pythonPath[MAX_PATH];
+	if (!findPythonExecutable(pythonPath, sizeof(pythonPath))) {
+		DEBUG_LOG(("MLBridge: Python not found. Install Python and add to PATH.\n"));
 		return false;
 	}
 
-	// Build command line
-	// Use pythonw.exe for no console window, or python.exe for debugging
+	// Build command line - try pythonw first (no console), then python
 	char cmdLine[MAX_PATH * 2];
-	snprintf(cmdLine, sizeof(cmdLine), "pythonw.exe \"%s\" --episodes 9999", scriptPath);
+	Bool usePythonW = false;
+
+	// Check if pythonw exists in same directory as python
+	char pythonwPath[MAX_PATH];
+	strncpy(pythonwPath, pythonPath, sizeof(pythonwPath) - 1);
+	char* pythonExe = strstr(pythonwPath, "python.exe");
+	if (pythonExe) {
+		// Replace python.exe with pythonw.exe
+		strncpy(pythonExe, "pythonw.exe", strlen("pythonw.exe") + 1);
+		if (fileExists(pythonwPath)) {
+			usePythonW = true;
+		}
+	}
+
+	snprintf(cmdLine, sizeof(cmdLine), "\"%s\" \"%s\" --episodes 9999",
+		usePythonW ? pythonwPath : pythonPath, scriptPath);
 
 	DEBUG_LOG(("MLBridge: Launching trainer: %s\n", cmdLine));
+	DEBUG_LOG(("MLBridge: Working directory: %s\n", workDir));
 
 	// Set up process creation
 	STARTUPINFOA si;
@@ -261,10 +373,6 @@ Bool MLBridge::launchTrainer()
 	ZeroMemory(&si, sizeof(si));
 	si.cb = sizeof(si);
 	ZeroMemory(&pi, sizeof(pi));
-
-	// Set working directory to game's python folder
-	char workDir[MAX_PATH];
-	snprintf(workDir, sizeof(workDir), "%s\\python", gameDir);
 
 	// Create the process
 	BOOL success = CreateProcessA(
@@ -282,16 +390,24 @@ Bool MLBridge::launchTrainer()
 
 	if (!success) {
 		DWORD error = GetLastError();
-		(void)error;  // Suppress unused warning in release builds
+		(void)error;  // Suppress unused variable warning in release builds
 		DEBUG_LOG(("MLBridge: Failed to launch trainer, error %d\n", error));
 
-		// Try with python.exe instead (might not have pythonw)
-		snprintf(cmdLine, sizeof(cmdLine), "python.exe \"%s\" --episodes 9999", scriptPath);
-		success = CreateProcessA(NULL, cmdLine, NULL, NULL, FALSE,
-			CREATE_NO_WINDOW | DETACHED_PROCESS, NULL, workDir, &si, &pi);
+		// Try with python.exe if we used pythonw
+		if (usePythonW) {
+			snprintf(cmdLine, sizeof(cmdLine), "\"%s\" \"%s\" --episodes 9999",
+				pythonPath, scriptPath);
+			DEBUG_LOG(("MLBridge: Retrying with python.exe: %s\n", cmdLine));
+
+			success = CreateProcessA(NULL, cmdLine, NULL, NULL, FALSE,
+				CREATE_NO_WINDOW | DETACHED_PROCESS, NULL, workDir, &si, &pi);
+		}
 
 		if (!success) {
-			DEBUG_LOG(("MLBridge: Also failed with python.exe, error %d\n", GetLastError()));
+			DEBUG_LOG(("MLBridge: All launch attempts failed, error %d\n", GetLastError()));
+			DEBUG_LOG(("MLBridge: Ensure Python is installed and in PATH.\n"));
+			// FIX B10: Reset launch flag on complete failure to allow retry
+			m_trainerLaunched = false;
 			return false;
 		}
 	}
@@ -315,19 +431,31 @@ Bool MLBridge::writeMessage(const char* data, UnsignedInt length)
 		return false;
 	}
 
-	// Protocol: 4-byte length prefix + data
-	DWORD bytesWritten = 0;
+	// FIX B1: Atomic write - combine length prefix and data into single buffer
+	// This prevents corruption if interrupted between writes
+	static const UnsignedInt MAX_ATOMIC_BUFFER = 65536;  // 64KB limit
+	UnsignedInt totalLength = sizeof(UnsignedInt) + length;
 
-	// Write length
-	if (!WriteFile((HANDLE)m_pipeHandle, &length, sizeof(UnsignedInt), &bytesWritten, NULL)) {
-		DEBUG_LOG(("MLBridge: Write length failed, disconnecting\n"));
+	if (totalLength > MAX_ATOMIC_BUFFER) {
+		DEBUG_LOG(("MLBridge: Message too large for atomic write (%d bytes)\n", totalLength));
+		return false;
+	}
+
+	// Build combined buffer: [4-byte length][data]
+	char atomicBuffer[MAX_ATOMIC_BUFFER];
+	memcpy(atomicBuffer, &length, sizeof(UnsignedInt));
+	memcpy(atomicBuffer + sizeof(UnsignedInt), data, length);
+
+	// Single atomic write
+	DWORD bytesWritten = 0;
+	if (!WriteFile((HANDLE)m_pipeHandle, atomicBuffer, totalLength, &bytesWritten, NULL)) {
+		DEBUG_LOG(("MLBridge: Atomic write failed, disconnecting\n"));
 		disconnect();
 		return false;
 	}
 
-	// Write data
-	if (!WriteFile((HANDLE)m_pipeHandle, data, length, &bytesWritten, NULL)) {
-		DEBUG_LOG(("MLBridge: Write data failed, disconnecting\n"));
+	if (bytesWritten != totalLength) {
+		DEBUG_LOG(("MLBridge: Partial write (%d/%d bytes), disconnecting\n", bytesWritten, totalLength));
 		disconnect();
 		return false;
 	}
@@ -470,6 +598,48 @@ AsciiString MLBridge::stateToJson(const MLGameState& state)
 	return AsciiString(buffer);
 }
 
+// FIX R1: Validate state values before sending to ML server
+// Returns true if all values are finite (not NaN or Inf)
+static Bool validateStateValue(Real value, const char* name)
+{
+	if (!isfinite(value)) {
+		DEBUG_LOG(("MLBridge: Invalid state value for '%s': %f\n", name, value));
+		return false;
+	}
+	return true;
+}
+
+Bool MLBridge::validateState(const MLGameState& state)
+{
+	Bool valid = true;
+
+	// Validate all float fields
+	valid &= validateStateValue(state.money, "money");
+	valid &= validateStateValue(state.powerBalance, "powerBalance");
+	valid &= validateStateValue(state.incomeRate, "incomeRate");
+	valid &= validateStateValue(state.supplyUsed, "supplyUsed");
+
+	for (int i = 0; i < 3; i++) {
+		valid &= validateStateValue(state.ownInfantry[i], "ownInfantry");
+		valid &= validateStateValue(state.ownVehicles[i], "ownVehicles");
+		valid &= validateStateValue(state.ownAircraft[i], "ownAircraft");
+		valid &= validateStateValue(state.ownStructures[i], "ownStructures");
+		valid &= validateStateValue(state.enemyInfantry[i], "enemyInfantry");
+		valid &= validateStateValue(state.enemyVehicles[i], "enemyVehicles");
+		valid &= validateStateValue(state.enemyAircraft[i], "enemyAircraft");
+		valid &= validateStateValue(state.enemyStructures[i], "enemyStructures");
+	}
+
+	valid &= validateStateValue(state.gameTimeMinutes, "gameTimeMinutes");
+	valid &= validateStateValue(state.techLevel, "techLevel");
+	valid &= validateStateValue(state.baseThreat, "baseThreat");
+	valid &= validateStateValue(state.armyStrength, "armyStrength");
+	valid &= validateStateValue(state.underAttack, "underAttack");
+	valid &= validateStateValue(state.distanceToEnemy, "distanceToEnemy");
+
+	return valid;
+}
+
 Bool MLBridge::sendState(const MLGameState& state)
 {
 	if (!m_connected) {
@@ -477,6 +647,12 @@ Bool MLBridge::sendState(const MLGameState& state)
 		if (!connect()) {
 			return false;
 		}
+	}
+
+	// FIX R1: Validate state before sending
+	if (!validateState(state)) {
+		DEBUG_LOG(("MLBridge: State validation failed, skipping send\n"));
+		return false;
 	}
 
 	AsciiString json = stateToJson(state);
@@ -692,6 +868,29 @@ Bool MLBridge::isRecommendationStale() const
 
 	UnsignedInt currentFrame = TheGameLogic ? TheGameLogic->getFrame() : 0;
 	return (currentFrame - m_lastRecommendationFrame) > RECOMMENDATION_TIMEOUT_FRAMES;
+}
+
+// FIX I1: Check for extended staleness and trigger reconnection
+Bool MLBridge::checkAndHandleStaleness()
+{
+	if (!m_hasRecommendation) {
+		return false;  // Nothing to check yet
+	}
+
+	UnsignedInt currentFrame = TheGameLogic ? TheGameLogic->getFrame() : 0;
+	UnsignedInt staleDuration = currentFrame - m_lastRecommendationFrame;
+
+	// If stale for longer than alert threshold, log error and try to reconnect
+	if (staleDuration > RECOMMENDATION_STALE_ALERT_FRAMES) {
+		DEBUG_LOG(("MLBridge ERROR: Recommendation stale for %u frames (>%u), triggering reconnect\n",
+			staleDuration, RECOMMENDATION_STALE_ALERT_FRAMES));
+
+		// Disconnect to force reconnect on next attempt
+		disconnect();
+		return true;  // Indicates reconnection was triggered
+	}
+
+	return false;
 }
 
 MLRecommendation MLBridge::getValidRecommendation() const

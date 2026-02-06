@@ -494,6 +494,8 @@ Object* findNearestEnemy(Object* unit, Real* outDist, Real* outAngle)
     );
     MemoryPoolObjectHolder holder(iter);
 
+    // FIX P6: Use distSq comparison to avoid sqrt in hot loop
+    Real nearestDistSq = nearestDist * nearestDist;
     for (Object* obj = iter->first(); obj; obj = iter->next())
     {
         if (obj->isEffectivelyDead())
@@ -505,21 +507,31 @@ Object* findNearestEnemy(Object* unit, Real* outDist, Real* outAngle)
 
         Real dx = objPos->x - unitPos->x;
         Real dy = objPos->y - unitPos->y;
-        Real dist = sqrtf(dx * dx + dy * dy);
+        Real distSq = dx * dx + dy * dy;
 
-        if (dist < nearestDist)
+        if (distSq < nearestDistSq)
         {
-            nearestDist = dist;
+            nearestDistSq = distSq;
             nearestEnemy = obj;
         }
     }
+    // Convert back to actual distance for return value
+    nearestDist = sqrtf(nearestDistSq);
 
     if (nearestEnemy && outAngle)
     {
         const Coord3D* enemyPos = nearestEnemy->getPosition();
-        Real dx = enemyPos->x - unitPos->x;
-        Real dy = enemyPos->y - unitPos->y;
-        *outAngle = atan2f(dy, dx);
+        // FIX C1: Null check on getPosition() result
+        if (!enemyPos)
+        {
+            *outAngle = 0.0f;
+        }
+        else
+        {
+            Real dx = enemyPos->x - unitPos->x;
+            Real dy = enemyPos->y - unitPos->y;
+            *outAngle = atan2f(dy, dx);
+        }
     }
 
     if (outDist)

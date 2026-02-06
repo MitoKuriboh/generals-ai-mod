@@ -40,27 +40,59 @@
 #include "GameLogic/Module/AIUpdate.h"
 #include "GameLogic/Module/SpecialPowerModule.h"
 #include "Common/SpecialPower.h"
+// FIX P1: Include PartitionManager for efficient spatial queries
+#include "GameLogic/PartitionManager.h"
+#include "GameLogic/ObjectIter.h"
 
 // File-based ML logging (works in release builds)
 #define ENABLE_ML_FILE_LOG 1
 
 #ifdef ENABLE_ML_FILE_LOG
 static FILE* g_mlLogFile = NULL;
-static void mlLogWrite(const char* fmt, ...) {
+static Int g_mlLogRefCount = 0;  // FIX B5: Track log file users for proper cleanup
+
+static void mlLogOpen() {
 	if (!g_mlLogFile) {
 		g_mlLogFile = fopen("C:\\Users\\Public\\ml_decisions.log", "a");
 	}
+	g_mlLogRefCount++;
+}
+
+static void mlLogClose() {
+	// FIX B5: Only close file when last user releases it
+	if (g_mlLogRefCount > 0) {
+		g_mlLogRefCount--;
+		if (g_mlLogRefCount == 0 && g_mlLogFile) {
+			fclose(g_mlLogFile);
+			g_mlLogFile = NULL;
+		}
+	}
+}
+
+static void mlLogWrite(const char* fmt, ...) {
+	if (!g_mlLogFile) {
+		return;  // Log file not opened
+	}
+	va_list args;
+	va_start(args, fmt);
+	vfprintf(g_mlLogFile, fmt, args);
+	va_end(args);
+	// FIX P5: Only flush periodically instead of every write for performance
+	// The file will be flushed when closed or when buffer is full
+}
+
+// Explicit flush for critical messages
+static void mlLogFlush() {
 	if (g_mlLogFile) {
-		va_list args;
-		va_start(args, fmt);
-		vfprintf(g_mlLogFile, fmt, args);
-		va_end(args);
 		fflush(g_mlLogFile);
 	}
 }
+
 #define ML_LOG(x) mlLogWrite x
+#define ML_LOG_FLUSH() mlLogFlush()
 #else
 #define ML_LOG(x)
+#define ML_LOG_FLUSH()
 #endif
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
@@ -75,6 +107,8 @@ AILearningPlayer::AILearningPlayer( Player *p ) : AISkirmishPlayer(p),
 	m_teamsHeld(0),
 	m_lastAttackFrame(0),
 	m_gameEndSent(false),
+	m_lastEnemyProximityScanFrame(0),  // FIX C5
+	m_enemiesNearBase(false),           // FIX C5
 	m_tacticalEnabled(true),
 	m_tacticalDecisionInterval(TacticalConfig::DECISION_INTERVAL),
 	m_microEnabled(true),
@@ -90,6 +124,12 @@ AILearningPlayer::AILearningPlayer( Player *p ) : AISkirmishPlayer(p),
 	memset(m_trackedUnitIds, 0, sizeof(m_trackedUnitIds));
 	memset(m_strategicOutput, 0, sizeof(m_strategicOutput));
 	m_cachedBasePos.x = m_cachedBasePos.y = m_cachedBasePos.z = 0;
+	m_basePosValidatedFrame = 0;  // FIX B6: Initialize base position cache frame
+
+	// FIX B5: Open log file with reference counting
+#ifdef ENABLE_ML_FILE_LOG
+	mlLogOpen();
+#endif
 
 	DEBUG_LOG(("AILearningPlayer created for player %s\n",
 		TheNameKeyGenerator->keyToName(p->getPlayerNameKey()).str()));
@@ -99,6 +139,12 @@ AILearningPlayer::~AILearningPlayer()
 {
 	m_mlBridge.disconnect();
 	DEBUG_LOG(("AILearningPlayer destroyed\n"));
+
+	// FIX B5: Close log file when last instance is destroyed
+#ifdef ENABLE_ML_FILE_LOG
+	ML_LOG_FLUSH();  // Flush any buffered data before closing
+	mlLogClose();
+#endif
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
@@ -174,6 +220,7 @@ void AILearningPlayer::newMap()
 	m_trackedUnitCount = 0;
 	m_hasValidBasePos = false;
 	m_cachedBasePos.x = m_cachedBasePos.y = m_cachedBasePos.z = 0;
+	m_basePosValidatedFrame = 0;  // FIX B6: Reset base position cache
 
 	m_mlBridge.connect();
 	AISkirmishPlayer::newMap();
@@ -247,6 +294,8 @@ void AILearningPlayer::processMLRecommendations()
 		if (!m_currentRecommendation.valid) {
 			ML_LOG(("MLBridge: Recommendation stale, using parent AI logic\n"));
 		}
+		// FIX I1: Check for extended staleness and trigger reconnection
+		m_mlBridge.checkAndHandleStaleness();
 	}
 }
 
@@ -258,23 +307,32 @@ void AILearningPlayer::collectTeamsForBatch(MLBatchedRequest& request)
 {
 	if (!m_player) return;
 
-	// Iterate through player's teams
-	for (Team* team = TheTeamFactory->getFirstTeam(); team; team = team->getNext()) {
-		// Check if team belongs to our player
-		if (team->getControllingPlayer() != m_player) continue;
+	// Get player's team prototypes
+	const Player::PlayerTeamList* teamProtos = m_player->getPlayerTeams();
+	if (!teamProtos) return;
 
-		// Check if team needs tactical update
-		if (!teamNeedsTacticalUpdate(team)) continue;
+	// Iterate through player's team prototypes
+	for (Player::PlayerTeamList::const_iterator it = teamProtos->begin();
+		 it != teamProtos->end() && request.numTeams < MAX_TEAMS_PER_BATCH; ++it) {
+		TeamPrototype* proto = *it;
+		if (!proto) continue;
 
-		// Build tactical state for this team
-		TacticalState state;
-		buildTeamTacticalState(team, state);
+		// Iterate team instances of this prototype
+		for (DLINK_ITERATOR<Team> iter = proto->iterate_TeamInstanceList();
+			 !iter.done() && request.numTeams < MAX_TEAMS_PER_BATCH; iter.advance()) {
+			Team* team = iter.cur();
+			if (!team) continue;
 
-		// Add to batch
-		m_mlBridge.addTeamToBatch(request, team->getID(), state);
+			// Check if team needs tactical update
+			if (!teamNeedsTacticalUpdate(team)) continue;
 
-		// Limit teams per batch
-		if (request.numTeams >= MAX_TEAMS_PER_BATCH) break;
+			// Build tactical state for this team
+			TacticalState state;
+			buildTeamTacticalState(team, state);
+
+			// Add to batch
+			m_mlBridge.addTeamToBatch(request, team->getID(), state);
+		}
 	}
 }
 
@@ -328,6 +386,15 @@ Bool AILearningPlayer::shouldMicroUnit(Object* unit)
 		if (currentFrame - lastDamageFrame < 60) return true;
 	}
 
+	// FIX C5: Avoid nested iteration when called from collectUnitsForBatch.
+	// If we've already done a full enemy proximity scan this frame, skip redundant iteration.
+	// This prevents O(n²) iteration when checking many units in a single frame.
+	UnsignedInt currentFrame = TheGameLogic->getFrame();
+	if (m_lastEnemyProximityScanFrame == currentFrame) {
+		// Already scanned this frame - use cached result based on whether any enemies are near base
+		return m_enemiesNearBase;
+	}
+
 	// Check for nearby enemies
 	const Coord3D* unitPos = unit->getPosition();
 	if (unitPos) {
@@ -348,10 +415,18 @@ Bool AILearningPlayer::shouldMicroUnit(Object* unit)
 			Real dy = otherPos->y - unitPos->y;
 			Real distSq = dx * dx + dy * dy;
 
-			if (distSq < 300.0f * 300.0f) return true;  // Enemy within 300 units
+			if (distSq < 300.0f * 300.0f) {
+				// Cache the result for this frame
+				m_lastEnemyProximityScanFrame = currentFrame;
+				m_enemiesNearBase = true;
+				return true;  // Enemy within 300 units
+			}
 		}
 	}
 
+	// No enemies found nearby - cache negative result for this frame
+	m_lastEnemyProximityScanFrame = currentFrame;
+	m_enemiesNearBase = false;
 	return false;
 }
 
@@ -487,38 +562,59 @@ Real AILearningPlayer::calculateTechLevel()
 
 Real AILearningPlayer::calculateBaseThreat()
 {
-	Coord3D basePos = {0, 0, 0};
-	Bool hasBase = false;
+	// Use cached base position if available
+	Coord3D basePos;
+	if (!getBasePosition(basePos)) {
+		return 1.0f;  // No base = max threat
+	}
 
+	// FIX P1: Use PartitionManager for efficient spatial query instead of O(n) iteration
+	// Need a reference object for relationship filter - use any of our structures
+	Object* refObj = NULL;
 	for (Object* obj = TheGameLogic->getFirstObject(); obj; obj = obj->getNextObject()) {
-		if (obj->getControllingPlayer() != m_player) continue;
-		if (obj->isKindOf(KINDOF_COMMANDCENTER) && !obj->isEffectivelyDead()) {
-			const Coord3D* baseCoord = obj->getPosition();
-			if (!baseCoord) continue;
-			basePos = *baseCoord;
-			hasBase = true;
-			break;
+		if (obj->getControllingPlayer() == m_player && !obj->isEffectivelyDead()) {
+			if (obj->isKindOf(KINDOF_STRUCTURE)) {
+				refObj = obj;
+				break;
+			}
 		}
 	}
 
-	if (!hasBase) return 1.0f;
+	if (!refObj) {
+		// No structures, try any unit
+		for (Object* obj = TheGameLogic->getFirstObject(); obj; obj = obj->getNextObject()) {
+			if (obj->getControllingPlayer() == m_player && !obj->isEffectivelyDead()) {
+				refObj = obj;
+				break;
+			}
+		}
+	}
+
+	if (!refObj) {
+		return 1.0f;  // No units at all = max threat
+	}
 
 	Int nearbyEnemies = 0;
 
-	for (Object* obj = TheGameLogic->getFirstObject(); obj; obj = obj->getNextObject()) {
-		if (obj->getControllingPlayer() == m_player) continue;
-		if (obj->isEffectivelyDead()) continue;
+	// Set up filters for enemies only
+	PartitionFilterRelationship filterRel(refObj, PartitionFilterRelationship::ALLOW_ENEMIES);
+	PartitionFilterAlive filterAlive;
+	PartitionFilter* filters[4];
+	filters[0] = &filterRel;
+	filters[1] = &filterAlive;
+	filters[2] = NULL;
+
+	SimpleObjectIterator* iter = ThePartitionManager->iterateObjectsInRange(
+		&basePos,
+		MLConfig::THREAT_DETECTION_RADIUS,
+		FROM_CENTER_2D,
+		filters
+	);
+	MemoryPoolObjectHolder holder(iter);
+
+	for (Object* obj = iter->first(); obj; obj = iter->next()) {
 		if (!obj->isKindOf(KINDOF_CAN_ATTACK)) continue;
-
-		const Coord3D* pos = obj->getPosition();
-		if (!pos) continue;
-		Real dx = pos->x - basePos.x;
-		Real dy = pos->y - basePos.y;
-		Real dist = sqrt(dx*dx + dy*dy);
-
-		if (dist < MLConfig::THREAT_DETECTION_RADIUS) {
-			nearbyEnemies++;
-		}
+		nearbyEnemies++;
 	}
 
 	return min(1.0f, (Real)nearbyEnemies / 20.0f);
@@ -870,10 +966,13 @@ Bool AILearningPlayer::selectTeamToBuild()
 		m_teamTimer = m_teamSeconds * LOGICFRAMES_PER_SECOND;
 		Money* money = m_player->getMoney();
 		UnsignedInt currentMoney = money ? money->countMoney() : 0;
-		if (currentMoney < TheAI->getAiData()->m_resourcesPoor) {
-			m_teamTimer = m_teamTimer / TheAI->getAiData()->m_teamPoorMod;
-		} else if (currentMoney > TheAI->getAiData()->m_resourcesWealthy) {
-			m_teamTimer = m_teamTimer / TheAI->getAiData()->m_teamWealthyMod;
+		// FIX C4: Null check for TheAI and getAiData() before accessing
+		if (TheAI && TheAI->getAiData()) {
+			if (currentMoney < TheAI->getAiData()->m_resourcesPoor) {
+				m_teamTimer = m_teamTimer / TheAI->getAiData()->m_teamPoorMod;
+			} else if (currentMoney > TheAI->getAiData()->m_resourcesWealthy) {
+				m_teamTimer = m_teamTimer / TheAI->getAiData()->m_teamWealthyMod;
+			}
 		}
 		return true;
 	}
@@ -1020,10 +1119,16 @@ void AILearningPlayer::checkReadyTeams()
 
 Bool AILearningPlayer::getBasePosition(Coord3D& outPos)
 {
-	// Return cached position if valid
+	UnsignedInt currentFrame = TheGameLogic->getFrame();
+
+	// FIX B6: Check if cache is still fresh (within lifetime)
 	if (m_hasValidBasePos) {
-		outPos = m_cachedBasePos;
-		return true;
+		if ((currentFrame - m_basePosValidatedFrame) < BASE_POS_CACHE_LIFETIME) {
+			outPos = m_cachedBasePos;
+			return true;
+		}
+		// Cache expired, need to refresh
+		m_hasValidBasePos = false;
 	}
 
 	// Find command center
@@ -1034,12 +1139,15 @@ Bool AILearningPlayer::getBasePosition(Coord3D& outPos)
 			if (pos) {
 				m_cachedBasePos = *pos;
 				m_hasValidBasePos = true;
+				m_basePosValidatedFrame = currentFrame;  // FIX B6: Track cache time
 				outPos = m_cachedBasePos;
 				return true;
 			}
 		}
 	}
 
+	// No CC found - invalidate cache
+	m_hasValidBasePos = false;
 	return false;
 }
 
@@ -1095,11 +1203,24 @@ void AILearningPlayer::executeTacticalCommand(Team* team, const TacticalCommand&
 {
 	if (!team) return;
 
+	// FIX: Null check for TheAI before calling createGroup
+	if (!TheAI) {
+		ML_LOG(("executeTacticalCommand: TheAI is NULL, cannot execute command\n"));
+		return;
+	}
+
 	// Get team as AIGroup for issuing commands
 	AIGroup* group = TheAI->createGroup();
 	if (!group) return;
 
 	team->getTeamAsAIGroup(group);
+
+	// FIX: Verify group has members
+	if (group->getCount() == 0) {
+		ML_LOG(("executeTacticalCommand: Team %d has no members in group\n", cmd.teamId));
+		group->deleteInstance();
+		return;
+	}
 
 	// Calculate world position from normalized coordinates
 	// Assuming map is approximately 3000x3000 units
@@ -1153,9 +1274,11 @@ void AILearningPlayer::executeTacticalCommand(Team* team, const TacticalCommand&
 				// Find and trigger ready special abilities in the team
 				Bool abilityUsed = FALSE;
 
-				for (Object* obj = team->getFirstObject(); obj && !abilityUsed; obj = obj->getNextTeamMember())
+				for (DLINK_ITERATOR<Object> iter = team->iterate_TeamMemberList();
+					 !iter.done() && !abilityUsed; iter.advance())
 				{
-					if (obj->isEffectivelyDead())
+					Object* obj = iter.cur();
+					if (!obj || obj->isEffectivelyDead())
 						continue;
 
 					// Search for any ready special power on this unit

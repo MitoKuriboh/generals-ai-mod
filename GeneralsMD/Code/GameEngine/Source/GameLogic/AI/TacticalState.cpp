@@ -132,6 +132,7 @@ void TacticalCommand::clear()
 // =============================================================================
 
 // Helper struct for iterating team members
+// FIX P3: Combined data collection to avoid double iteration
 struct TeamMemberData
 {
     Int infantryCount;
@@ -151,10 +152,16 @@ struct TeamMemberData
     Bool hasTransport;
     Bool underFire;
 
+    // FIX P3: Store positions for spread calculation in single pass
+    static const Int MAX_UNIT_POS = 64;
+    Coord3D unitPositions[MAX_UNIT_POS];
+    Int posCount;
+
     TeamMemberData()
         : infantryCount(0), vehicleCount(0), aircraftCount(0), otherCount(0)
         , totalHealth(0), totalMaxHealth(0), unitCount(0)
         , totalExperience(0), maxSpread(0), hasTransport(false), underFire(false)
+        , posCount(0)
     {
         centerPos.x = centerPos.y = centerPos.z = 0;
     }
@@ -170,9 +177,19 @@ static void collectTeamMemberData(Object* obj, void* userData)
 
     // Accumulate position for center calculation
     const Coord3D* pos = obj->getPosition();
+    if (!pos)
+        return;
+
     data->centerPos.x += pos->x;
     data->centerPos.y += pos->y;
     data->centerPos.z += pos->z;
+
+    // FIX P3: Store position for spread calculation in same pass
+    if (data->posCount < TeamMemberData::MAX_UNIT_POS)
+    {
+        data->unitPositions[data->posCount] = *pos;
+        data->posCount++;
+    }
 
     // Get health
     BodyModuleInterface* body = obj->getBodyModule();
@@ -197,10 +214,10 @@ static void collectTeamMemberData(Object* obj, void* userData)
         data->hasTransport = true;
 
     // Check if under fire
-    if (obj->getBodyModule() && obj->getBodyModule()->getLastDamageTimestamp() > 0)
+    if (body && body->getLastDamageTimestamp() > 0)
     {
         UnsignedInt currentFrame = TheGameLogic->getFrame();
-        UnsignedInt lastDamage = obj->getBodyModule()->getLastDamageTimestamp();
+        UnsignedInt lastDamage = body->getLastDamageTimestamp();
         if (currentFrame - lastDamage < 60)  // Damaged in last 2 seconds
             data->underFire = true;
     }
@@ -262,10 +279,16 @@ void buildTacticalState(
     data.centerPos.y /= data.unitCount;
     data.centerPos.z /= data.unitCount;
 
-    // Calculate spread (cohesion)
-    Real spreadParams[3] = { data.centerPos.x, data.centerPos.y, 0 };
-    team->iterateObjects(calculateSpread, spreadParams);
-    Real maxSpread = spreadParams[2];
+    // FIX P3: Calculate spread from stored positions (avoids second iteration)
+    Real maxSpread = 0.0f;
+    for (Int i = 0; i < data.posCount; i++)
+    {
+        Real dx = data.unitPositions[i].x - data.centerPos.x;
+        Real dy = data.unitPositions[i].y - data.centerPos.y;
+        Real dist = sqrtf(dx * dx + dy * dy);
+        if (dist > maxSpread)
+            maxSpread = dist;
+    }
 
     // Normalize counts (0-20 units expected)
     Real totalUnits = (Real)(data.infantryCount + data.vehicleCount + data.aircraftCount + data.otherCount);
@@ -324,10 +347,18 @@ void buildTacticalState(
             }
         }
 
-        Real dx = teamPos->x - basePos.x;
-        Real dy = teamPos->y - basePos.y;
-        Real dist = sqrtf(dx * dx + dy * dy);
-        outState.distToBase = fminf(dist / TacticalConfig::MAX_BASE_DIST, 1.0f);
+        // FIX C2: Only calculate distance if we found a valid base
+        if (foundBase)
+        {
+            Real dx = teamPos->x - basePos.x;
+            Real dy = teamPos->y - basePos.y;
+            Real dist = sqrtf(dx * dx + dy * dy);
+            outState.distToBase = fminf(dist / TacticalConfig::MAX_BASE_DIST, 1.0f);
+        }
+        else
+        {
+            outState.distToBase = 1.0f;  // Max distance if no base
+        }
     }
 
     outState.underFire = data.underFire ? 1.0f : 0.0f;
@@ -403,7 +434,7 @@ Real calculateTeamCohesion(Team* team)
     if (!team)
         return 1.0f;
 
-    // Get team center
+    // Get team data (includes positions for spread calculation)
     TeamMemberData data;
     team->iterateObjects(collectTeamMemberData, &data);
 
@@ -413,10 +444,16 @@ Real calculateTeamCohesion(Team* team)
     data.centerPos.x /= data.unitCount;
     data.centerPos.y /= data.unitCount;
 
-    // Calculate max spread
-    Real spreadParams[3] = { data.centerPos.x, data.centerPos.y, 0 };
-    team->iterateObjects(calculateSpread, spreadParams);
-    Real maxSpread = spreadParams[2];
+    // FIX P3: Calculate max spread from stored positions (single pass)
+    Real maxSpread = 0.0f;
+    for (Int i = 0; i < data.posCount; i++)
+    {
+        Real dx = data.unitPositions[i].x - data.centerPos.x;
+        Real dy = data.unitPositions[i].y - data.centerPos.y;
+        Real dist = sqrtf(dx * dx + dy * dy);
+        if (dist > maxSpread)
+            maxSpread = dist;
+    }
 
     // Normalize: 0 spread = 1.0 cohesion, 500+ spread = 0.0 cohesion
     return 1.0f - fminf(maxSpread / 500.0f, 1.0f);

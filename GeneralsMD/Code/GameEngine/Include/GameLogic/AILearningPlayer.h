@@ -212,6 +212,10 @@ private:
 	// Game end tracking
 	Bool m_gameEndSent;        // True if we've sent game end notification
 
+	// FIX C5: Cache for enemy proximity check to avoid O(n²) iteration
+	UnsignedInt m_lastEnemyProximityScanFrame;  // Frame when last proximity scan done
+	Bool m_enemiesNearBase;                      // Cached result of proximity scan
+
 	// Helper methods for complete state extraction
 	Real calculateIncomeRate();
 	Real calculateSupplyUsed();
@@ -246,6 +250,9 @@ private:
 	// Base position cache
 	Coord3D m_cachedBasePos;
 	Bool m_hasValidBasePos;
+	// FIX B6: Track when base position was cached to detect staleness
+	UnsignedInt m_basePosValidatedFrame;
+	static const UnsignedInt BASE_POS_CACHE_LIFETIME = 150;  // Refresh every 5 seconds
 };
 
 #endif // _AI_LEARNING_PLAYER_H_

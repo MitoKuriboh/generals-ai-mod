@@ -251,6 +251,9 @@ public:
 	// Check if recommendation is stale (hasn't been updated recently)
 	Bool isRecommendationStale() const;
 
+	// FIX I1: Check for extended staleness and trigger reconnection if needed
+	Bool checkAndHandleStaleness();
+
 	// Get last received recommendation (returns defaults if stale)
 	const MLRecommendation& getLastRecommendation() const { return m_lastRecommendation; }
 
@@ -282,6 +285,9 @@ private:
 	// Parse micro command from JSON object
 	Bool parseMicroCommand(const char* json, MicroCommand& outCmd);
 
+	// FIX R1: State validation before sending
+	Bool validateState(const MLGameState& state);
+
 	// Low-level pipe operations
 	Bool writeMessage(const char* data, UnsignedInt length);
 	Bool readMessage(char* buffer, UnsignedInt bufferSize, UnsignedInt& outLength);
@@ -300,11 +306,14 @@ private:
 
 	// Reconnection throttle
 	UnsignedInt m_lastConnectAttempt;
-	static const UnsignedInt RECONNECT_INTERVAL_FRAMES = 300; // ~10 seconds
+	// FIX I4: Reduced from 300 (10 sec) to 60 (2 sec) for faster recovery
+	static const UnsignedInt RECONNECT_INTERVAL_FRAMES = 60; // ~2 seconds
 
 	// Recommendation staleness tracking
 	UnsignedInt m_lastRecommendationFrame;  // Frame when last recommendation received
 	static const UnsignedInt RECOMMENDATION_TIMEOUT_FRAMES = 60; // 2 seconds at 30 FPS
+	// FIX I1: Extended staleness threshold for alert/reconnection
+	static const UnsignedInt RECOMMENDATION_STALE_ALERT_FRAMES = 150; // 5 seconds - trigger reconnect
 
 	// Trainer process management
 	Bool m_trainerLaunched;
