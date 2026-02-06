@@ -74,7 +74,6 @@ def state_dict_to_tensor(state: Dict) -> torch.Tensor:
     # Current: 4 economy + 12 own + 12 enemy + 6 strategic + 3 faction = 37
     while len(features) < STATE_DIM:
         features.append(0.0)
-    features = features[:STATE_DIM]
 
     return torch.tensor(features, dtype=torch.float32)
 
@@ -84,15 +83,32 @@ def action_tensor_to_dict(action: torch.Tensor) -> Dict:
     # Action tensor has 8 values, all sigmoid-activated (0-1)
     a = action.detach().cpu().numpy()
 
+    # FIX H3: Check for NaN values and fall back to safe defaults
+    if np.any(np.isnan(a)) or np.any(np.isinf(a)):
+        print("[Model] WARNING: NaN/Inf detected in action tensor, using safe defaults")
+        return {
+            'priority_economy': 0.25,
+            'priority_defense': 0.25,
+            'priority_military': 0.25,
+            'priority_tech': 0.25,
+            'prefer_infantry': 0.33,
+            'prefer_vehicles': 0.34,
+            'prefer_aircraft': 0.33,
+            'aggression': 0.5,
+            'target_player': -1
+        }
+
     # Build priorities (normalize to sum to 1)
     priorities = np.array([a[0], a[1], a[2], a[3]])
     priorities = np.maximum(priorities, 0.05)  # Minimum 5%
-    priorities = priorities / priorities.sum()
+    # FIX P3: Add epsilon to prevent division by zero (NaN input safety)
+    priorities = priorities / (priorities.sum() + 1e-8)
 
     # Army preferences (normalize to sum to 1)
     army = np.array([a[4], a[5], a[6]])
     army = np.maximum(army, 0.1)  # Minimum 10%
-    army = army / army.sum()
+    # FIX P3: Add epsilon to prevent division by zero (NaN input safety)
+    army = army / (army.sum() + 1e-8)
 
     return {
         'priority_economy': float(priorities[0]),
@@ -162,7 +178,8 @@ class LegacyPolicyNetwork(nn.Module):
             action = action.clamp(0.0, 1.0)
             log_prob = dist.log_prob(action).sum(dim=-1)
 
-        return action.squeeze(0), log_prob.squeeze(0), value.squeeze(0)
+        # FIX: Keep consistent 1D shapes for legacy model too
+        return action.view(-1), log_prob.view(1), value.view(1)
 
     def evaluate_actions(self, states: torch.Tensor, actions: torch.Tensor
                          ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -293,7 +310,9 @@ class PolicyNetwork(nn.Module):
             # Clamp action for output only (wider range to reduce interference)
             action = action_raw.clamp(1e-7, 1 - 1e-7)
 
-        return action.squeeze(0), log_prob.squeeze(0), value.squeeze(0)
+        # FIX: Keep consistent 1D shapes to avoid torch.stack() failures
+        # squeeze(0) produces scalars when batch=1, view() ensures 1D tensors
+        return action.view(-1), log_prob.view(1), value.view(1)
 
     def evaluate_actions(self, states: torch.Tensor, actions: torch.Tensor
                          ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -327,7 +346,7 @@ class PolicyNetwork(nn.Module):
     def save(self, path: str):
         """Save model to file."""
         torch.save({
-            'state_dict': self.state_dict(),
+            'policy_state_dict': self.state_dict(),  # Consistent with PPOAgent.save()
             'state_dim': self.state_dim,
             'action_dim': self.action_dim,
         }, path)

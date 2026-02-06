@@ -23,7 +23,7 @@ Usage:
 from typing import Dict, Optional, Any
 from dataclasses import dataclass
 
-from training.config import WIN_REWARD, LOSS_REWARD, DRAW_REWARD
+from training.config import WIN_REWARD, LOSS_REWARD, DRAW_REWARD, STRUCTURE_THRESHOLD
 
 
 @dataclass
@@ -167,10 +167,6 @@ def calculate_reward(
 
 def _calculate_terminal_reward(state: Dict, config: RewardConfig) -> float:
     """Calculate terminal reward (win/loss/draw)."""
-    # FIX: Lowered threshold from 0.3 to 0.1 (log10(1+1)=0.3 means 1 building,
-    # log10(0+1)=0 means 0 buildings). Threshold 0.1 means truly no buildings.
-    STRUCTURE_THRESHOLD = 0.1
-
     # Check for loss (no structures)
     own_structures = state.get('own_structures', [0, 0, 0])
     if own_structures[0] < STRUCTURE_THRESHOLD:
@@ -329,21 +325,47 @@ def _calculate_penalties(
 
 
 def _count_units(state: Dict, prefix: str) -> int:
-    """Count total units from state."""
+    """Count total units from state.
+
+    Values are expected to be log10(count+1), so valid range is [0, ~3.5].
+    Values outside this range indicate format change or data corruption.
+    """
     total = 0
     for category in ['infantry', 'vehicles', 'aircraft']:
         key = f'{prefix}_{category}'
         arr = state.get(key, [0, 0, 0])
         if len(arr) > 0 and arr[0] > 0:
+            # Validate log10 scale assumption (max ~3000 units = log10(3001) ≈ 3.48)
+            if arr[0] > 4.0:
+                import logging
+                logging.getLogger(__name__).warning(
+                    f"Unexpected {key}[0]={arr[0]:.2f} - expected log10 scale [0, ~3.5]. "
+                    "Data format may have changed."
+                )
+                # Clamp to reasonable max to prevent overflow
+                arr[0] = min(arr[0], 4.0)
             total += int(10 ** arr[0] - 1)
     return total
 
 
 def _count_buildings(state: Dict, prefix: str) -> int:
-    """Count buildings from state."""
+    """Count buildings from state.
+
+    Values are expected to be log10(count+1), so valid range is [0, ~2.5].
+    Values outside this range indicate format change or data corruption.
+    """
     key = f'{prefix}_structures'
     arr = state.get(key, [0, 0, 0])
     if len(arr) > 0 and arr[0] > 0:
+        # Validate log10 scale assumption (max ~300 buildings = log10(301) ≈ 2.48)
+        if arr[0] > 3.0:
+            import logging
+            logging.getLogger(__name__).warning(
+                f"Unexpected {key}[0]={arr[0]:.2f} - expected log10 scale [0, ~2.5]. "
+                "Data format may have changed."
+            )
+            # Clamp to reasonable max to prevent overflow
+            arr[0] = min(arr[0], 3.0)
         return int(10 ** arr[0] - 1)
     return 0
 

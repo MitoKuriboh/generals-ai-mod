@@ -18,6 +18,7 @@ import numpy as np
 import torch
 
 from .model import state_dict_to_tensor, action_tensor_to_dict, STATE_DIM, TOTAL_ACTION_DIM
+from .config import STRUCTURE_THRESHOLD
 
 # Windows named pipe support
 if sys.platform == 'win32':
@@ -31,6 +32,11 @@ else:
 
 PIPE_NAME = r'\\.\pipe\generals_ml_bridge'
 MAX_EPISODE_STEPS = 3000  # ~100 minutes of game time, prevents infinite episodes
+
+# Connection timeouts - game can take a while to load
+DEFAULT_STATE_TIMEOUT = 30.0  # Seconds to wait for state message (was 5s, too short for slow start)
+DEFAULT_CONNECT_TIMEOUT = 120.0  # Seconds to wait for initial connection
+STATE_TIMEOUT_RETRY_COUNT = 3  # Retries before giving up on state
 
 
 @dataclass
@@ -55,9 +61,11 @@ class GeneralsEnv:
     Provides gym-like interface: reset(), step(), close()
     """
 
-    def __init__(self, pipe_name: str = PIPE_NAME, timeout_ms: int = 100):
+    def __init__(self, pipe_name: str = PIPE_NAME, timeout_ms: int = 100,
+                 state_timeout: float = DEFAULT_STATE_TIMEOUT):
         self.pipe_name = pipe_name
         self.timeout_ms = timeout_ms
+        self.state_timeout = state_timeout  # Configurable timeout for state reads
         self.pipe = None
         self.connected = False
 
@@ -119,13 +127,31 @@ class GeneralsEnv:
         try:
             # Read 4-byte length prefix
             result, length_bytes = win32file.ReadFile(self.pipe, 4)
+            # Check result code (0 = success, non-zero = error)
+            if result != 0:
+                return None
+            # Validate length read was complete
             if len(length_bytes) < 4:
                 return None
 
             length = struct.unpack('<I', length_bytes)[0]
 
-            # Read message data
-            result, data = win32file.ReadFile(self.pipe, length)
+            # Sanity check on length to prevent excessive memory allocation
+            if length == 0 or length > 1024 * 1024:  # Max 1MB message
+                return None
+
+            # Loop until all bytes received (pipe may return partial reads)
+            data = b''
+            while len(data) < length:
+                result, chunk = win32file.ReadFile(self.pipe, length - len(data))
+                # Check result code (0 = success)
+                if result != 0:
+                    print(f"[Env] ReadFile error: result={result}")
+                    return None
+                if not chunk:
+                    print(f"[Env] Incomplete read: expected {length} bytes, got {len(data)}")
+                    return None
+                data += chunk
             return data.decode('utf-8')
         except Exception as e:
             if hasattr(e, 'args') and e.args[0] == 109:  # ERROR_BROKEN_PIPE
@@ -168,8 +194,8 @@ class GeneralsEnv:
         self.prev_enemy_buildings = 0
         self.prev_money = 0
 
-        # Wait for first state from game
-        state = self._wait_for_state()
+        # Wait for first state from game (use longer timeout for initial connection)
+        state = self._wait_for_state(timeout=self.state_timeout)
         if state is None:
             raise RuntimeError("Failed to receive initial state from game")
 
@@ -202,7 +228,7 @@ class GeneralsEnv:
             return self._handle_disconnect()
 
         # Wait for next state
-        state = self._wait_for_state()
+        state = self._wait_for_state(timeout=self.state_timeout)
         if state is None:
             return self._handle_disconnect()
 
@@ -243,22 +269,49 @@ class GeneralsEnv:
 
         return state_dict_to_tensor(state), reward, terminated, truncated, info
 
-    def _wait_for_state(self, timeout: float = 5.0) -> Optional[Dict]:
-        """Wait for next state message from game."""
-        start = time.time()
-        while time.time() - start < timeout:
-            msg = self._read_message()
-            if msg:
-                try:
-                    return json.loads(msg)
-                except json.JSONDecodeError:
-                    continue
-            time.sleep(0.01)
+    def _wait_for_state(self, timeout: float = DEFAULT_STATE_TIMEOUT,
+                        retries: int = STATE_TIMEOUT_RETRY_COUNT) -> Optional[Dict]:
+        """Wait for next state message from game.
+
+        Args:
+            timeout: Maximum seconds to wait per attempt (default 30s).
+                     Timeout increases with exponential backoff on retries.
+            retries: Number of retry attempts (default 3)
+
+        Returns:
+            Parsed state dict or None if timeout
+        """
+        backoff_multiplier = 1.0
+        for attempt in range(retries):
+            current_timeout = timeout * backoff_multiplier
+            start = time.time()
+            while time.time() - start < current_timeout:
+                msg = self._read_message()
+                if msg:
+                    try:
+                        return json.loads(msg)
+                    except json.JSONDecodeError:
+                        continue
+                time.sleep(0.01)
+
+            if attempt < retries - 1:
+                print(f"[Env] State timeout after {current_timeout:.1f}s (attempt {attempt + 1}/{retries}), retrying with backoff...")
+                backoff_multiplier *= 1.5  # Exponential backoff
+
         return None
 
     def _calculate_reward(self, prev_state: Optional[Dict], state: Dict,
                           action: Dict) -> float:
-        """Calculate reward for state transition."""
+        """Calculate reward for state transition.
+
+        Args:
+            prev_state: Previous game state (None on first step)
+            state: Current game state
+            action: Action dictionary from policy (used by rewards.py for idle penalty check)
+
+        Returns:
+            Reward value for this transition
+        """
         from .rewards import calculate_reward
         return calculate_reward(prev_state, state, action, self)
 
@@ -269,10 +322,6 @@ class GeneralsEnv:
         Returns:
             (terminated, won): Whether episode ended and if we won
         """
-        # FIX: Lowered threshold from 0.3 to 0.1 (log10(1+1)=0.3 means 1 building,
-        # log10(0+1)=0 means 0 buildings). Threshold 0.1 means truly no buildings.
-        STRUCTURE_THRESHOLD = 0.1
-
         # Check if we lost (no structures)
         own_structures = state.get('own_structures', [0, 0, 0])
         if own_structures[0] < STRUCTURE_THRESHOLD:
@@ -331,7 +380,8 @@ class GeneralsEnv:
         if self.pipe and HAS_WIN32:
             try:
                 win32file.CloseHandle(self.pipe)
-            except:
+            except pywintypes.error:
+                # Handle may already be closed
                 pass
             self.pipe = None
         self.connected = False
@@ -389,7 +439,7 @@ class SimulatedEnv:
 
         info = {'raw_state': self.current_state}
 
-        # Add episode stats when terminated
+        # Add episode stats when terminated - use tracked values from simulation
         if terminated:
             won = self.current_state['army_strength'] > 1.2
             info['episode_stats'] = EpisodeStats(
@@ -397,10 +447,10 @@ class SimulatedEnv:
                 steps=self.step_count,
                 won=won,
                 game_time=self.current_state.get('game_time', 0),
-                units_killed=0,
-                units_lost=0,
-                buildings_destroyed=0,
-                buildings_lost=0,
+                units_killed=getattr(self, '_units_killed', 0),
+                units_lost=getattr(self, '_units_lost', 0),
+                buildings_destroyed=getattr(self, '_buildings_destroyed', 0),
+                buildings_lost=getattr(self, '_buildings_lost', 0),
                 final_army_strength=self.current_state.get('army_strength', 1.0),
                 final_money=self.current_state.get('money', 0),
             )

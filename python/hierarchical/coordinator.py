@@ -37,8 +37,8 @@ class InferenceConfig:
 
     # Decision intervals (in game frames, 30 fps)
     strategic_interval: int = 30      # 1 second
-    tactical_interval: int = 150      # 5 seconds per team
-    micro_interval: int = 15          # 0.5 seconds per unit
+    tactical_interval: int = 30       # 1 second per team (was 150 = 5 sec)
+    micro_interval: int = 5           # ~0.17 seconds per unit (was 15 = 0.5 sec)
 
     # Maximum entities per frame
     max_teams_per_frame: int = 10
@@ -47,6 +47,11 @@ class InferenceConfig:
     # Enable/disable layers
     tactical_enabled: bool = True
     micro_enabled: bool = True
+
+    # Memory management
+    cleanup_interval: int = 300       # Cleanup stale units every N frames (~10 sec)
+    stale_unit_max_age: int = 300     # Units not seen for this many frames are considered stale
+    hidden_state_staleness_threshold: int = 150  # Frames (~5 sec) before hidden state considered stale
 
     # Device
     device: str = 'cpu'
@@ -103,6 +108,9 @@ class HierarchicalCoordinator:
             'micro': [],
         }
 
+        # Memory management tracking
+        self._last_cleanup_frame: int = 0
+
     def process_frame(self, game_state: Dict, current_frame: int) -> Dict:
         """
         Process a game frame and return all recommendations.
@@ -125,6 +133,7 @@ class HierarchicalCoordinator:
             try:
                 t0 = time.perf_counter()
                 result['strategic'] = self._process_strategic(game_state)
+                result['strategic']['inference_failed'] = False
                 self.latency_stats['strategic'].append(time.perf_counter() - t0)
                 self.last_strategic_frame = current_frame
                 self.last_strategic_output = np.array([
@@ -137,20 +146,27 @@ class HierarchicalCoordinator:
             except Exception as e:
                 logger.error(f"Strategic inference failed: {e}")
                 result['strategic'] = self._default_strategic()
+                result['strategic']['inference_failed'] = True
 
         # Tactical layer (runs per team when due)
         if self.config.tactical_enabled and self.tactical is not None:
             try:
                 t0 = time.perf_counter()
+                teams_in_state = len(game_state.get('teams', {}))
                 teams_to_process = self._get_teams_due(game_state, current_frame)
                 if teams_to_process:
+                    logger.debug(f"Frame {current_frame}: Processing {len(teams_to_process)} teams (of {teams_in_state} in state)")
                     result['teams'] = self._process_tactical_batch(
                         game_state, teams_to_process, current_frame
                     )
+                    logger.debug(f"Frame {current_frame}: Tactical returned {len(result['teams'])} commands")
+                elif teams_in_state > 0 and current_frame % 1000 == 0:
+                    # Log occasionally why teams aren't due
+                    logger.debug(f"Frame {current_frame}: {teams_in_state} teams in state but none due (interval={self.config.tactical_interval})")
                 if result['teams']:
                     self.latency_stats['tactical'].append(time.perf_counter() - t0)
             except Exception as e:
-                logger.error(f"Tactical inference failed: {e}")
+                logger.error(f"Tactical inference failed: {e}", exc_info=True)
                 result['teams'] = []
 
         # Micro layer (runs per unit in combat when due)
@@ -158,16 +174,26 @@ class HierarchicalCoordinator:
         if self.config.micro_enabled and self.micro is not None:
             try:
                 t0 = time.perf_counter()
+                units_in_state = len(game_state.get('units', {}))
                 units_to_process = self._get_units_due(game_state, current_frame)
                 if units_to_process:
+                    logger.debug(f"Frame {current_frame}: Processing {len(units_to_process)} units (of {units_in_state} in state)")
                     result['units'] = self._process_micro_batch(
                         game_state, units_to_process, current_frame
                     )
+                    logger.debug(f"Frame {current_frame}: Micro returned {len(result['units'])} commands")
+                elif units_in_state > 0 and current_frame % 1000 == 0:
+                    logger.debug(f"Frame {current_frame}: {units_in_state} units in state but none due")
                 if result['units']:
                     self.latency_stats['micro'].append(time.perf_counter() - t0)
             except Exception as e:
-                logger.error(f"Micro inference failed: {e}")
+                logger.error(f"Micro inference failed: {e}", exc_info=True)
                 result['units'] = []
+
+        # FIX: Periodic cleanup to prevent memory leak from stale unit hidden states
+        if current_frame - self._last_cleanup_frame >= self.config.cleanup_interval:
+            self.cleanup_stale_units(current_frame, self.config.stale_unit_max_age)
+            self._last_cleanup_frame = current_frame
 
         return result
 
@@ -199,6 +225,11 @@ class HierarchicalCoordinator:
         teams = game_state.get('teams', {})
         due_teams = []
 
+        # Log once per game when we first see teams
+        if teams and not hasattr(self, '_logged_first_teams'):
+            logger.info(f"First teams seen at frame {current_frame}: {len(teams)} teams")
+            self._logged_first_teams = True
+
         for team_id_str, team_data in teams.items():
             # FIX: Safe int conversion to handle malformed data
             try:
@@ -208,12 +239,19 @@ class HierarchicalCoordinator:
                 continue
 
             last_frame = self.last_tactical_frame.get(team_id, 0)
+            frames_since = current_frame - last_frame
 
-            if current_frame - last_frame >= self.config.tactical_interval:
+            if frames_since >= self.config.tactical_interval:
                 due_teams.append(team_id)
 
                 if len(due_teams) >= self.config.max_teams_per_frame:
                     break
+
+        # Log when teams are found or not (periodically)
+        if teams and not due_teams and current_frame % 1000 == 0:
+            sample_team = list(teams.keys())[0]
+            sample_last = self.last_tactical_frame.get(int(sample_team), 0)
+            logger.info(f"Frame {current_frame}: {len(teams)} teams but none due. Sample team {sample_team} last={sample_last}, interval={self.config.tactical_interval}")
 
         return due_teams
 
@@ -229,8 +267,12 @@ class HierarchicalCoordinator:
 
             # Handle raw array from C++ (list of 64 floats) vs structured dict
             if isinstance(team_data, list):
+                # Validate array size before using
+                if len(team_data) < 64:
+                    logger.warning(f"Team {team_id} data has {len(team_data)} floats, expected 64. Padding with zeros.")
+                    team_data = team_data + [0.0] * (64 - len(team_data))
                 # Raw 64-float array from C++ - use directly as tensor
-                state_tensor = torch.tensor(team_data, dtype=torch.float32)
+                state_tensor = torch.tensor(team_data[:64], dtype=torch.float32)
             elif isinstance(team_data, dict):
                 # Structured dict (from simulation) - parse via build_tactical_state
                 team_state = build_tactical_state(
@@ -258,8 +300,14 @@ class HierarchicalCoordinator:
                     batch_states[i], deterministic=True
                 )
                 cmd = tactical_to_command(action_dict)
-                cmd['team_id'] = team_id
-                results.append(cmd)
+                # Rename fields to match C++ expected format
+                results.append({
+                    'id': team_id,
+                    'action': cmd['action'],
+                    'x': cmd['target_x'],
+                    'y': cmd['target_y'],
+                    'attitude': cmd['attitude'],
+                })
 
         return results
 
@@ -290,18 +338,20 @@ class HierarchicalCoordinator:
         return due_units
 
     def _should_micro_unit(self, unit_data) -> bool:
-        """Determine if a unit should receive micro control."""
+        """Determine if a unit should receive micro control.
+
+        When units come from C++ as raw arrays, they've already been filtered
+        by shouldMicroUnit() in C++. We trust that decision and just check
+        for valid data.
+        """
         # Handle raw array from C++ (list of 32 floats)
+        # C++ already decided these units need micro, so just validate data
         if isinstance(unit_data, list):
-            # MicroState layout:
-            # Index 12: nearestEnemyDist (normalized)
-            # Index 18: underFire (1.0 if taking damage)
-            # Index 19: abilityReady (1.0 if ready)
             if len(unit_data) >= 32:
-                under_fire = unit_data[18] > 0.5
-                nearby_enemies = unit_data[12] < 0.5  # Normalized distance
-                ability_ready = unit_data[19] > 0.5
-                return under_fire or nearby_enemies or ability_ready
+                # C++ already filtered - trust its decision
+                # Only do sanity check: unit must have health > 0
+                health = unit_data[4]  # Index 4 = health
+                return health > 0.01
             return False
 
         # Handle structured dict (from simulation)
@@ -328,8 +378,12 @@ class HierarchicalCoordinator:
 
             # Handle raw array from C++ (list of 32 floats) vs structured dict
             if isinstance(unit_data, list):
+                # Validate array size before using
+                if len(unit_data) < 32:
+                    logger.warning(f"Unit {unit_id} data has {len(unit_data)} floats, expected 32. Padding with zeros.")
+                    unit_data = unit_data + [0.0] * (32 - len(unit_data))
                 # Raw 32-float array from C++ - use directly as tensor
-                state_tensor = torch.tensor(unit_data, dtype=torch.float32).to(self.device)
+                state_tensor = torch.tensor(unit_data[:32], dtype=torch.float32).to(self.device)
             elif isinstance(unit_data, dict):
                 # Structured dict (from simulation) - parse via build_micro_state
                 team_objective = self._get_team_objective_for_unit(game_state, unit_data)
@@ -341,8 +395,16 @@ class HierarchicalCoordinator:
                 state_tensor = torch.zeros(32).to(self.device)
 
             # Get or create hidden state for this unit
+            # Check for staleness: if hidden state is too old, reset it to avoid LSTM incoherence
+            last_frame = self.last_micro_frame.get(unit_id, 0)
+            frames_since_last = current_frame - last_frame
             if unit_id not in self.micro_hidden_states:
                 self.micro.reset_hidden(1, self.device)
+            elif frames_since_last > self.config.hidden_state_staleness_threshold:
+                # Hidden state is stale - reset to avoid LSTM coherence issues
+                logger.debug(f"Unit {unit_id} hidden state stale ({frames_since_last} frames), resetting")
+                self.micro.reset_hidden(1, self.device)
+                self.micro_hidden_states.pop(unit_id, None)
             else:
                 self.micro.hidden = self.micro_hidden_states[unit_id]
 
@@ -353,10 +415,14 @@ class HierarchicalCoordinator:
             # Store hidden state
             self.micro_hidden_states[unit_id] = self.micro.hidden
 
-            # Build command
+            # Build command with C++ expected field names
             cmd = micro_to_command(action_dict)
-            cmd['unit_id'] = unit_id
-            results.append(cmd)
+            results.append({
+                'id': unit_id,
+                'action': cmd['action'],
+                'angle': cmd['move_angle'],
+                'dist': cmd['move_distance'],
+            })
 
             self.last_micro_frame[unit_id] = current_frame
 

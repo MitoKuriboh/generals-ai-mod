@@ -51,8 +51,24 @@ HIDDEN_DIM = 256          # Hidden layer size (increased for RTS complexity)
 PIPE_NAME = r'\\.\pipe\generals_ml_bridge'
 
 # Base directory: use GENERALS_AI_DIR env var or default
-_DEFAULT_BASE = r'C:\Users\Public\game-ai-agent'
-BASE_DIR = Path(os.environ.get('GENERALS_AI_DIR', _DEFAULT_BASE))
+_DEFAULT_BASE = r'C:\Users\Public\generals-ai-mod'
+_env_dir = os.environ.get('GENERALS_AI_DIR')
+
+if _env_dir:
+    BASE_DIR = Path(_env_dir)
+    # Validate the path exists and is a directory
+    if not BASE_DIR.exists():
+        raise ValueError(
+            f"GENERALS_AI_DIR='{_env_dir}' does not exist. "
+            f"Create the directory or unset the environment variable to use default: {_DEFAULT_BASE}"
+        )
+    if not BASE_DIR.is_dir():
+        raise ValueError(
+            f"GENERALS_AI_DIR='{_env_dir}' is not a directory. "
+            f"Set it to a valid directory path."
+        )
+else:
+    BASE_DIR = Path(_DEFAULT_BASE)
 
 # Derived paths (auto-created if needed)
 CHECKPOINT_DIR = BASE_DIR / 'checkpoints' / 'unified'
@@ -75,3 +91,11 @@ WIN_REWARD = 100.0
 LOSS_REWARD = -100.0
 DRAW_REWARD = 0.0
 REWARD_CLIP = 100.0       # Normalizer clips at this value (matches terminal rewards)
+
+# =============================================================================
+# Game State Thresholds
+# =============================================================================
+# Log10 scale threshold for "no structures" detection.
+# log10(1+1) = 0.3 means 1 building, log10(0+1) = 0 means 0 buildings.
+# Threshold 0.1 means truly no buildings.
+STRUCTURE_THRESHOLD = 0.1

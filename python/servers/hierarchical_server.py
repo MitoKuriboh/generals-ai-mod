@@ -33,12 +33,15 @@ from micro.state import MicroState
 from hierarchical.coordinator import HierarchicalCoordinator, InferenceConfig
 from hierarchical.batch_bridge import BatchedMLBridge, validate_request
 
-# Configure logging
+# Configure logging - DEBUG level to see coordinator internals
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# Also set coordinator logger to DEBUG
+logging.getLogger('hierarchical.coordinator').setLevel(logging.DEBUG)
 
 
 class HierarchicalServer:
@@ -143,10 +146,24 @@ class HierarchicalServer:
         """
         t0 = time.perf_counter()
 
+        # Handle game_end messages
+        try:
+            data = json.loads(json_str)
+            if data.get('type') == 'game_end':
+                victory = data.get('victory', False)
+                game_time = data.get('game_time', 0)
+                logger.info(f"Game ended: {'Victory' if victory else 'Defeat'} at {game_time:.1f}s")
+                self.stats['games_played'] = self.stats.get('games_played', 0) + 1
+                return json.dumps({"ack": True})
+        except json.JSONDecodeError:
+            pass
+
         # Validate request
         valid, error = validate_request(json_str)
         if not valid:
-            logger.warning(f"Invalid request: {error}")
+            # Log first 200 chars of message for debugging
+            preview = json_str[:200] if len(json_str) > 200 else json_str
+            logger.warning(f"Invalid request: {error} - Message: {preview}")
             return self._error_response(error)
 
         # Parse request
@@ -172,6 +189,8 @@ class HierarchicalServer:
         self.stats['micro_inferences'] += len(result.get('units', []))
 
         # Build response
+        if result['teams'] or result['units']:
+            logger.info(f"Frame {request.frame}: Returning {len(result['teams'])} tactical, {len(result['units'])} micro commands")
         response_json = self.bridge.build_response_from_result(request.frame, result)
 
         # Track latency
@@ -254,6 +273,7 @@ def run_pipe_server(server: HierarchicalServer, pipe_name: str = r'\\.\pipe\gene
     signal.signal(signal.SIGTERM, signal_handler)
 
     while server.running:
+        pipe = None
         try:
             # Create named pipe
             pipe = win32pipe.CreateNamedPipe(
@@ -289,17 +309,20 @@ def run_pipe_server(server: HierarchicalServer, pipe_name: str = r'\\.\pipe\gene
                     if result != 0:
                         break
 
-                    message = data.decode('utf-8')
+                    # Decode with error handling to prevent crash on malformed UTF-8
+                    try:
+                        message = data.decode('utf-8')
+                    except UnicodeDecodeError as e:
+                        logger.warning(f"UTF-8 decode error: {e}, using replacement chars")
+                        message = data.decode('utf-8', errors='replace')
 
                     # Process message
                     response = server.process_message(message)
 
-                    # Write response
+                    # Write response atomically (length + data in single call)
                     response_bytes = response.encode('utf-8')
                     length_bytes = len(response_bytes).to_bytes(4, 'little')
-
-                    win32file.WriteFile(pipe, length_bytes)
-                    win32file.WriteFile(pipe, response_bytes)
+                    win32file.WriteFile(pipe, length_bytes + response_bytes)
 
                 except pywintypes.error as e:
                     if e.args[0] == 109:  # Broken pipe
@@ -308,13 +331,20 @@ def run_pipe_server(server: HierarchicalServer, pipe_name: str = r'\\.\pipe\gene
                         logger.error(f"Pipe error: {e}")
                     break
 
-            # Cleanup
-            win32pipe.DisconnectNamedPipe(pipe)
-            win32file.CloseHandle(pipe)
-
         except Exception as e:
             logger.error(f"Server error: {e}")
             time.sleep(1)
+        finally:
+            # Cleanup pipe handle - always runs even if exception occurs
+            if pipe is not None:
+                try:
+                    win32pipe.DisconnectNamedPipe(pipe)
+                except pywintypes.error:
+                    pass  # Already disconnected
+                try:
+                    win32file.CloseHandle(pipe)
+                except pywintypes.error:
+                    pass  # Already closed
 
     server.print_stats()
     logger.info("Server stopped")
@@ -377,15 +407,19 @@ def run_socket_server(server: HierarchicalServer, host: str = 'localhost', port:
                     if len(data) != length:
                         break
 
-                    message = data.decode('utf-8')
+                    # Decode with error handling to prevent crash on malformed UTF-8
+                    try:
+                        message = data.decode('utf-8')
+                    except UnicodeDecodeError as e:
+                        logger.warning(f"UTF-8 decode error: {e}, using replacement chars")
+                        message = data.decode('utf-8', errors='replace')
 
                     # Process message
                     response = server.process_message(message)
 
-                    # Write response
+                    # Write response atomically (length + data in single call)
                     response_bytes = response.encode('utf-8')
-                    client.sendall(struct.pack('<I', len(response_bytes)))
-                    client.sendall(response_bytes)
+                    client.sendall(struct.pack('<I', len(response_bytes)) + response_bytes)
 
                 except socket.timeout:
                     continue

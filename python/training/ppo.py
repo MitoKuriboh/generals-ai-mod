@@ -51,7 +51,8 @@ class RolloutBuffer:
     Buffer for storing rollout data for PPO updates.
     """
 
-    def __init__(self):
+    def __init__(self, max_size: int = 10000):
+        self.max_size = max_size
         self.states = []
         self.actions = []
         self.rewards = []
@@ -65,11 +66,22 @@ class RolloutBuffer:
     def add(self, state: torch.Tensor, action: torch.Tensor, reward: float,
             value: torch.Tensor, log_prob: torch.Tensor, done: bool):
         """Add a transition to the buffer."""
-        self.states.append(state.clone())
-        self.actions.append(action.clone())
+        # FIX H4: Check buffer size limit
+        if len(self.states) >= self.max_size:
+            print(f"[PPO] Warning: Buffer reached max size ({self.max_size}), dropping oldest transition")
+            self.states.pop(0)
+            self.actions.pop(0)
+            self.rewards.pop(0)
+            self.values.pop(0)
+            self.log_probs.pop(0)
+            self.dones.pop(0)
+
+        # FIX H1: Add .detach() to prevent computation graphs from being kept alive
+        self.states.append(state.clone().detach())
+        self.actions.append(action.clone().detach())
         self.rewards.append(reward)
-        self.values.append(value.clone())
-        self.log_probs.append(log_prob.clone())
+        self.values.append(value.clone().detach())
+        self.log_probs.append(log_prob.clone().detach())
         self.dones.append(done)
 
     def compute_returns_and_advantages(self, last_value: torch.Tensor,
@@ -121,7 +133,8 @@ class RolloutBuffer:
         returns = self.returns
 
         # Generate minibatches
-        minibatch_size = n // num_minibatches
+        # FIX P2: Ensure minibatch_size >= 1 to prevent infinite loop when n < num_minibatches
+        minibatch_size = max(1, n // num_minibatches)
         for start in range(0, n, minibatch_size):
             end = min(start + minibatch_size, n)
             batch_indices = indices[start:end]
@@ -244,7 +257,14 @@ class PPOAgent:
                 log_probs, values, entropy = self.policy.evaluate_actions(states, actions)
 
                 # Policy loss (PPO-Clip)
-                ratio = torch.exp(log_probs - old_log_probs)
+                # FIX P1: Clamp exp input to prevent overflow (exp(20) ≈ 485M, exp(-20) ≈ 0)
+                log_prob_diff = log_probs - old_log_probs
+                # FIX H5: Warn when extreme differences detected (indicates policy divergence)
+                extreme_diffs = (log_prob_diff.abs() > 10).float().mean()
+                if extreme_diffs > 0.1:  # More than 10% of samples have extreme differences
+                    print(f"[PPO] WARNING: {extreme_diffs:.1%} of samples have extreme log-prob differences (>10)")
+                    print(f"[PPO]   This may indicate training instability or data issues")
+                ratio = torch.exp(torch.clamp(log_prob_diff, -20, 20))
                 clipped_ratio = torch.clamp(
                     ratio, 1 - self.config.clip_epsilon, 1 + self.config.clip_epsilon
                 )
@@ -253,15 +273,21 @@ class PPOAgent:
                     clipped_ratio * advantages
                 ).mean()
 
-                # Value loss with proper clipping (clip value changes, not predictions)
+                # Value loss with clipped value function update (PPO-style)
+                # This clips the VALUE CHANGE (not the prediction) to stay within
+                # clip_value of the old prediction. The max of clipped/unclipped
+                # losses prevents the value function from changing too quickly,
+                # which can destabilize policy gradients that depend on accurate
+                # advantage estimates.
                 if self.config.clip_value > 0:
                     old_values = batch['old_values'].to(self.device)
-                    # Clip value function updates relative to old predictions
+                    # Clipped value: old + clamp(new - old, -eps, +eps)
                     values_clipped = old_values + torch.clamp(
                         values - old_values,
                         -self.config.clip_value,
                         self.config.clip_value
                     )
+                    # Take max of clipped and unclipped losses (pessimistic bound)
                     value_loss = torch.max(
                         (values - returns) ** 2,
                         (values_clipped - returns) ** 2
