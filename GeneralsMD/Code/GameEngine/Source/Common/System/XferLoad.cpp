@@ -196,7 +196,7 @@ void XferLoad::xferSnapshot( Snapshot *snapshot )
 // ------------------------------------------------------------------------------------------------
 void XferLoad::xferAsciiString( AsciiString *asciiStringData )
 {
-	
+
 	// read bytes of string length to follow
 	UnsignedByte len;
 	xferUnsignedByte( &len );
@@ -204,6 +204,13 @@ void XferLoad::xferAsciiString( AsciiString *asciiStringData )
 	// read all the string data
 	const Int MAX_XFER_LOAD_STRING_BUFFER = 1024;
 	static Char buffer[ MAX_XFER_LOAD_STRING_BUFFER ];
+
+	// Bounds check to prevent buffer overflow
+	if( len >= MAX_XFER_LOAD_STRING_BUFFER )
+	{
+		DEBUG_CRASH(("XferLoad::xferAsciiString - string length %d exceeds buffer size", len));
+		len = MAX_XFER_LOAD_STRING_BUFFER - 1;
+	}
 
 	if( len > 0 )
 		xferUser( buffer, sizeof( Byte ) * len );
@@ -219,7 +226,7 @@ void XferLoad::xferAsciiString( AsciiString *asciiStringData )
 // ------------------------------------------------------------------------------------------------
 void XferLoad::xferUnicodeString( UnicodeString *unicodeStringData )
 {
-	
+
 	// read bytes of string length to follow
 	UnsignedByte len;
 	xferUnsignedByte( &len );
@@ -227,6 +234,13 @@ void XferLoad::xferUnicodeString( UnicodeString *unicodeStringData )
 	// read all the string data
 	const Int MAX_XFER_LOAD_STRING_BUFFER = 1024;
 	static WideChar buffer[ MAX_XFER_LOAD_STRING_BUFFER ];
+
+	// Bounds check to prevent buffer overflow
+	if( len >= MAX_XFER_LOAD_STRING_BUFFER )
+	{
+		DEBUG_CRASH(("XferLoad::xferUnicodeString - string length %d exceeds buffer size", len));
+		len = MAX_XFER_LOAD_STRING_BUFFER - 1;
+	}
 
 	if( len > 0 )
 		xferUser( buffer, sizeof( WideChar ) * len );

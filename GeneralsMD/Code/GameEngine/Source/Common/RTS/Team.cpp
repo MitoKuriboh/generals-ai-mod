@@ -2285,7 +2285,10 @@ void Team::deleteTeam(Bool ignoreDead)
 
 	// this doesn't actually delete the team, it deletes the members of the team.
 	// the team itself will be deleted in updateState.
-	for (DLINK_ITERATOR<Object> iter = iterate_TeamMemberList(); !iter.done(); iter.advance()) 
+	// Note: We must collect objects first because destroyObject() removes them from the list,
+	// which would cause DLINK iterator invalidation if we destroyed during iteration.
+	std::list<Object *> objectsToDestroy;
+	for (DLINK_ITERATOR<Object> iter = iterate_TeamMemberList(); !iter.done(); iter.advance())
 	{
 		Object *obj = iter.cur();
 		if (!obj) {
@@ -2297,9 +2300,15 @@ void Team::deleteTeam(Bool ignoreDead)
 		// they use it on a team with things that can't die, then yeah, the Team will last forever.  But then it is
 		// user error.
 		if( ignoreDead && obj->isEffectivelyDead() )
-			continue; 
+			continue;
 
-		TheGameLogic->destroyObject(obj);
+		objectsToDestroy.push_back( obj );
+	}
+
+	// Now destroy the collected objects safely
+	for( std::list<Object *>::iterator it = objectsToDestroy.begin(); it != objectsToDestroy.end(); ++it )
+	{
+		TheGameLogic->destroyObject( *it );
 	}
 }
 

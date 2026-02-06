@@ -507,9 +507,16 @@ Bool DumbProjectileBehavior::projectileHandleCollision( Object *other )
 				if (numKilled > 0)
 				{
 					// note, fx is played at center of building, not at grenade's location
-					FXList::doFXObj(d->m_garrisonHitKillFX, other, NULL);
+					if (d->m_garrisonHitKillFX && other)
+					{
+						FXList::doFXObj(d->m_garrisonHitKillFX, other, NULL);
+					}
 
-					getObject()->getControllingPlayer()->getAcademyStats()->recordClearedGarrisonedBuilding();
+					Player* player = getObject()->getControllingPlayer();
+					if (player)
+					{
+						player->getAcademyStats()->recordClearedGarrisonedBuilding();
+					}
 
 					// don't do the normal explosion; just destroy ourselves & return
 					TheGameLogic->destroyObject(getObject());

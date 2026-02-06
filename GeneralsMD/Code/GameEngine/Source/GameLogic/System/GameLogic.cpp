@@ -3878,7 +3878,11 @@ void GameLogic::removeObjectFromLookupTable( Object *obj )
 
 	// remove from lookup table
 //	m_objHash.erase( obj->getID() );
-	m_objVector[ obj->getID() ] = NULL;
+	ObjectID id = obj->getID();
+	if( (Int)id < m_objVector.size() )
+	{
+		m_objVector[ id ] = NULL;
+	}
 
 }  // end removeObjectFromLookupTable
 

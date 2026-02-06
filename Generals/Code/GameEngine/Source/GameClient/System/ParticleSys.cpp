@@ -247,6 +247,12 @@ void Particle::computeAlphaRate( void )
 	Real delta = m_alphaKey[ m_alphaTargetKey ].value - m_alphaKey[ m_alphaTargetKey-1 ].value;
 	UnsignedInt time = m_alphaKey[ m_alphaTargetKey ].frame - m_alphaKey[ m_alphaTargetKey-1 ].frame;
 
+	if (time == 0)
+	{
+		m_alphaRate = 0.0f;
+		return;
+	}
+
 	m_alphaRate = delta/time;
 }
 
@@ -264,6 +270,15 @@ void Particle::computeColorRate( void )
 	}
 
 	UnsignedInt time = m_colorKey[ m_colorTargetKey ].frame - m_colorKey[ m_colorTargetKey-1 ].frame;
+
+	if (time == 0)
+	{
+		m_colorRate.red = 0.0f;
+		m_colorRate.green = 0.0f;
+		m_colorRate.blue = 0.0f;
+		return;
+	}
+
 	Real delta = m_colorKey[ m_colorTargetKey ].color.red - m_colorKey[ m_colorTargetKey-1 ].color.red;
 	m_colorRate.red = delta/time;
 
@@ -512,7 +527,7 @@ Bool Particle::update( void )
 	else if (m_color.red > 1.0f)
 		m_color.red = 1.0f;
 
-	if (m_color.red < 0.0f)
+	if (m_color.green < 0.0f)
 		m_color.green = 0.0f;
 	else if (m_color.green > 1.0f)
 		m_color.green = 1.0f;
@@ -798,22 +813,20 @@ void Particle::loadPostProcess( void )
 	if( m_systemUnderControlID != INVALID_PARTICLE_SYSTEM_ID )
 	{
 		ParticleSystem *system;
-		
+
 		// find system
 		system = TheParticleSystemManager->findParticleSystem( m_systemUnderControlID );
+
+		// sanity check - ensure system was found before using it
+		if( system == NULL )
+		{
+			DEBUG_CRASH(( "Particle::loadPostProcess - Unable to find system under control pointer\n" ));
+			throw SC_INVALID_DATA;
+		}
 
 		// set us as the control particle for this system
 		system->setControlParticle( this );
 		controlParticleSystem( system );
-
-		// sanity
-		if( m_systemUnderControlID == NULL )
-		{
-
-			DEBUG_CRASH(( "Particle::loadPostProcess - Unable to find system under control pointer\n" ));
-			throw SC_INVALID_DATA;
-
-		}  // end if
 
 	}  // end if
 
@@ -2065,13 +2078,17 @@ Bool ParticleSystem::update( Int localPlayerIndex  )
 	if (m_controlParticle)
 	{
 		const Coord3D *controlPos = m_controlParticle->getPosition();
-		/// @todo Concatenate this, instead of overriding (MSB)
-		m_transform.Set_X_Translation( controlPos->x );
-		m_transform.Set_Y_Translation( controlPos->y );
-		m_transform.Set_Z_Translation( controlPos->z );
-		m_isIdentity = false;
-		m_lastPos = m_pos;
-		m_pos = *controlPos;
+		// Validate particle position before dereferencing
+		if (controlPos)
+		{
+			/// @todo Concatenate this, instead of overriding (MSB)
+			m_transform.Set_X_Translation( controlPos->x );
+			m_transform.Set_Y_Translation( controlPos->y );
+			m_transform.Set_Z_Translation( controlPos->z );
+			m_isIdentity = false;
+			m_lastPos = m_pos;
+			m_pos = *controlPos;
+		}
 	}
 
 

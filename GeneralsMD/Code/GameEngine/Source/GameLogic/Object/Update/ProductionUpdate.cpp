@@ -427,7 +427,17 @@ Bool ProductionUpdate::queueCreateUnit( const ThingTemplate *unitType, Productio
 	// take the cost for the build away from the player
 	Player *player = getObject()->getControllingPlayer();
 	Money *money = player->getMoney();
-	money->withdraw( unitType->calcCostToBuild( player ) );
+	UnsignedInt cost = unitType->calcCostToBuild( player );
+	UnsignedInt actualWithdrawn = money->withdraw( cost );
+
+	// Verify we got the full amount - if not, refund what we took and fail
+	if( actualWithdrawn < cost )
+	{
+		// Could not afford - refund partial withdrawal and fail
+		if( actualWithdrawn > 0 )
+			money->deposit( actualWithdrawn );
+		return FALSE;
+	}
 
 	// allocate a new production entry
 	ProductionEntry *production = newInstance(ProductionEntry);
@@ -1145,22 +1155,34 @@ void ProductionUpdate::cancelAndRefundAllProduction( void )
 	// Empirically, in release the code can loop forever.  So we limit to 100 passes. jba. [8/31/2003]
 	const Int productionLimit = 100;// With luck, we never queue up 100 units. [8/31/2003]
 	Int i;
-	for (i=0; i<productionLimit; i++) 
+	for (i=0; i<productionLimit; i++)
 	{
-		// iterate through our production queue
-		if( m_productionQueue )
+		// Exit early if queue is empty
+		if( !m_productionQueue )
 		{
-			if( m_productionQueue->getProductionType() == PRODUCTION_UNIT )
-				cancelUnitCreate( m_productionQueue->getProductionID() );
-			else if( m_productionQueue->getProductionType() == PRODUCTION_UPGRADE )
-				cancelUpgrade( m_productionQueue->getProductionUpgrade() );
-			else
-			{
-				// unknown production type
-				DEBUG_CRASH(( "ProductionUpdate::cancelAndRefundAllProduction - Unknown production type '%d'\n", m_productionQueue->getProductionType() ));
-				return;
-			}  // end else
-		}  // end if
+			break;
+		}
+
+		// Track the current head to detect if cancellation actually removed it
+		ProductionEntry *queueHead = m_productionQueue;
+
+		if( m_productionQueue->getProductionType() == PRODUCTION_UNIT )
+			cancelUnitCreate( m_productionQueue->getProductionID() );
+		else if( m_productionQueue->getProductionType() == PRODUCTION_UPGRADE )
+			cancelUpgrade( m_productionQueue->getProductionUpgrade() );
+		else
+		{
+			// unknown production type
+			DEBUG_CRASH(( "ProductionUpdate::cancelAndRefundAllProduction - Unknown production type '%d'\n", m_productionQueue->getProductionType() ));
+			return;
+		}
+
+		// Safety check: if the queue head didn't change, we're stuck - break to prevent infinite loop
+		if( m_productionQueue == queueHead )
+		{
+			DEBUG_CRASH(( "ProductionUpdate::cancelAndRefundAllProduction - Failed to remove queue entry, breaking to prevent infinite loop\n" ));
+			break;
+		}
 	}
 }  // end cancelAndRefundAllProduction
 

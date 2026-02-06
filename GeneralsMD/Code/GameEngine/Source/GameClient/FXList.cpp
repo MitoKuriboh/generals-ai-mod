@@ -116,7 +116,11 @@ public:
 		AudioEventRTS sound(m_soundName);
 		if (primary)
 		{
-			sound.setPlayerIndex(primary->getControllingPlayer()->getPlayerIndex());
+			Player* player = primary->getControllingPlayer();
+			if (player)
+			{
+				sound.setPlayerIndex(player->getPlayerIndex());
+			}
 			sound.setPosition(primary->getPosition());
 		}
 
@@ -212,7 +216,8 @@ public:
 
 			// estimate how long it will take us to get to the destination
 			Real dist = calcDist(*primary, *secondary) - m_length;
-			Real frames = (dist >= 0.0f && speed >= 0.0f) ? (dist / speed) : 1;
+			// Guard against division by zero when speed is 0
+			Real frames = (dist >= 0.0f && speed > 0.0f) ? (dist / speed) : 1;
 			Int framesAdjusted = REAL_TO_INT_CEIL(frames * m_decayAt);
 			tracer->setExpirationDate(TheGameLogic->getFrame() + framesAdjusted);
 		}
@@ -537,29 +542,30 @@ public:
 
 	virtual void doFXObj(const Object* primary, const Object* secondary) const
 	{
-		if (primary)
+		// Early return if no primary object
+		if (!primary)
 		{
+			DEBUG_CRASH(("You must have a primary source for this effect"));
+			return;
+		}
 
-			if (m_ricochet && secondary)
-			{
-				// HERE WE MUST BUILD A MATRIX WHICH WILL ORIENT THE NEW PARTICLE SYSTEM TO FACE AWAY FROM THE SECONDARY OBJECT
-				// THE RESULT SHOULD LOOK LIKE THE DIRECTION OF THE "ATTACK" IS CARRIED THROUGH LIKE A RICOCHET
-				Real deltaX = primary->getPosition()->x - secondary->getPosition()->x;
-				Real deltaY = primary->getPosition()->y - secondary->getPosition()->y;
-				Real aimingAngle = atan2(deltaY, deltaX);
-				Matrix3D aimingMatrix(1);
-				aimingMatrix.Rotate_Z( aimingAngle );
+		if (m_ricochet && secondary)
+		{
+			// HERE WE MUST BUILD A MATRIX WHICH WILL ORIENT THE NEW PARTICLE SYSTEM TO FACE AWAY FROM THE SECONDARY OBJECT
+			// THE RESULT SHOULD LOOK LIKE THE DIRECTION OF THE "ATTACK" IS CARRIED THROUGH LIKE A RICOCHET
+			Real deltaX = primary->getPosition()->x - secondary->getPosition()->x;
+			Real deltaY = primary->getPosition()->y - secondary->getPosition()->y;
+			Real aimingAngle = atan2(deltaY, deltaX);
+			Matrix3D aimingMatrix(1);
+			aimingMatrix.Rotate_Z( aimingAngle );
 
-				reallyDoFX(primary->getPosition(), &aimingMatrix, primary, 0.0f);
-			}
-			else
-				// if we have an object, then adjust the offset and direction by the object's transformation
-				// matrix, so that (say) an offset of +10 in the z axis "follows" the orientation of the object.
-				reallyDoFX(primary->getPosition(), primary->getTransformMatrix(), primary, 0.0f);
+			reallyDoFX(primary->getPosition(), &aimingMatrix, primary, 0.0f);
 		}
 		else
 		{
-			DEBUG_CRASH(("You must have a primary source for this effect"));
+			// if we have an object, then adjust the offset and direction by the object's transformation
+			// matrix, so that (say) an offset of +10 in the z axis "follows" the orientation of the object.
+			reallyDoFX(primary->getPosition(), primary->getTransformMatrix(), primary, 0.0f);
 		}
 	}
 
@@ -638,7 +644,8 @@ protected:
 					if (m_rotateZ != 0.0f)
 						sys->rotateLocalTransformZ(m_rotateZ);
 
-					if (m_attachToObject && thingToAttachTo)
+					// Validate object still exists and is not marked for deletion before attaching
+					if (m_attachToObject && thingToAttachTo && !thingToAttachTo->isEffectivelyDead())
 						sys->attachToObject(thingToAttachTo);
 					else
 						sys->setPosition( &newPos );
@@ -734,6 +741,9 @@ protected:
 
 	void doFxAtBones(const Object* obj, Int start) const
 	{
+		if (!obj)
+			return;
+
     Coord3D bonePos[MAX_BONE_POINTS];
     Matrix3D boneMtx[MAX_BONE_POINTS];
 

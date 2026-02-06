@@ -505,7 +505,19 @@ Int WeaponTemplate::getClipReloadTime(const WeaponBonus& bonus) const
 {
 	// yes, divide, not multiply; the larger the rate-of-fire bonus, the shorter
 	// we want the reload time to be.
-	return REAL_TO_INT_FLOOR(m_clipReloadTime / bonus.getField(WeaponBonus::RATE_OF_FIRE));	
+	Real bonusROF = bonus.getField(WeaponBonus::RATE_OF_FIRE);
+	// Guard against division by very small values that could overflow Int range
+	if (bonusROF < 0.001f)
+	{
+		bonusROF = 0.001f;
+	}
+	Real result = m_clipReloadTime / bonusROF;
+	// Clamp result to prevent integer overflow
+	if (result > (Real)INT_MAX)
+	{
+		result = (Real)INT_MAX;
+	}
+	return REAL_TO_INT_FLOOR(result);
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -1737,14 +1749,14 @@ static void clipToTerrainExtent(Coord3D& approachTargetPos)
 Bool Weapon::computeApproachTarget(const Object *source, const Object *target, const Coord3D *pos, Real angleOffset, Coord3D& approachTargetPos) const
 {
 	// compute unit direction vector from us to our victim
-	const Coord3D *targetPos;
+	const Coord3D *targetPos = NULL;
 	Coord3D dir;
-	if (target) 
+	if (target)
 	{
 		targetPos = target->getPosition();
 		ThePartitionManager->getVectorTo( target, source, ATTACK_RANGE_CALC_TYPE, dir );
-	}	
-	else if (pos) 
+	}
+	else if (pos)
 	{
 		targetPos = pos;
 		ThePartitionManager->getVectorTo( source, pos, ATTACK_RANGE_CALC_TYPE, dir );
@@ -1753,16 +1765,18 @@ Bool Weapon::computeApproachTarget(const Object *source, const Object *target, c
 		dir.y = -dir.y;
 		dir.z = -dir.z;
 	}
-	else
+
+	// Defensive check: ensure targetPos is valid before proceeding
+	if (targetPos == NULL)
 	{
-		DEBUG_CRASH(("error"));
+		DEBUG_CRASH(("computeApproachTarget: no valid target position"));
 		approachTargetPos.zero();
 		return false;
 	}
 
 	Real dist = dir.length();
 	Real minAttackRange = m_template->getMinimumAttackRange();
-	if (minAttackRange > PATHFIND_CELL_SIZE_F && dist < minAttackRange) 
+	if (minAttackRange > PATHFIND_CELL_SIZE_F && dist < minAttackRange)
 	{
 		// We aret too close, so move away from the target.
 		DEBUG_ASSERTCRASH((minAttackRange<0.9f*getAttackRange(source)), ("Min attack range is too near attack range.\n"));
@@ -1775,7 +1789,18 @@ Bool Weapon::computeApproachTarget(const Object *source, const Object *target, c
 #else
 		dir.z = srcPos.z-targetPos->z;
 #endif
-		dir.normalize();
+		// Guard against zero-length direction vector (same position)
+		if (dir.length() < 0.001f)
+		{
+			// Pick an arbitrary direction when at exact same position
+			dir.x = 1.0f;
+			dir.y = 0.0f;
+			dir.z = 0.0f;
+		}
+		else
+		{
+			dir.normalize();
+		}
 
 		// if we're airborne and too close, just head for the opposite side.
 		if (source->isAboveTerrain())

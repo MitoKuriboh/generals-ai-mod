@@ -1206,8 +1206,12 @@ void INI::parseThingTemplate( INI* ini, void * /*instance*/, void *store, const 
 	{
 		const ThingTemplate *tt = TheThingFactory->findTemplate(token);	// could be null!
 		DEBUG_ASSERTCRASH(tt, ("ThingTemplate %s not found!\n",token));
-		// assign it, even if null!
-		*theThingTemplate = tt;
+		if (tt)
+		{
+			*theThingTemplate = tt;
+		}
+		// If template not found in release, leave pointer unchanged rather than assigning NULL
+		// This prevents crashes when code later dereferences the pointer
 	}
 
 } 
@@ -1230,8 +1234,11 @@ void INI::parseArmorTemplate( INI* ini, void * /*instance*/, void *store, const 
 	{
 		const ArmorTemplate *tt = TheArmorStore->findArmorTemplate(token);	// could be null!
 		DEBUG_ASSERTCRASH(tt, ("ArmorTemplate %s not found!\n",token));
-		// assign it, even if null!
-		*theArmorTemplate = tt;
+		if (tt)
+		{
+			*theArmorTemplate = tt;
+		}
+		// If template not found in release, leave pointer unchanged rather than assigning NULL
 	}
 
 } 
@@ -1248,8 +1255,11 @@ void INI::parseWeaponTemplate( INI* ini, void * /*instance*/, void *store, const
 
 	const WeaponTemplate *tt = TheWeaponStore->findWeaponTemplate(token);	// could be null!
 	DEBUG_ASSERTCRASH(tt || stricmp(token, "None") == 0, ("WeaponTemplate %s not found!\n",token));
-	// assign it, even if null!
-	*theWeaponTemplate = tt;
+	if (tt || stricmp(token, "None") == 0)
+	{
+		*theWeaponTemplate = tt;
+	}
+	// If template not found in release, leave pointer unchanged rather than assigning NULL
 
 } 
 
@@ -1265,8 +1275,11 @@ void INI::parseFXList( INI* ini, void * /*instance*/, void *store, const void* /
 
 	const FXList *fxl = TheFXListStore->findFXList(token);	// could be null!
 	DEBUG_ASSERTCRASH(fxl != NULL || stricmp(token, "None") == 0, ("FXList %s not found!\n",token));
-	// assign it, even if null!
-	*theFXList = fxl;
+	if (fxl || stricmp(token, "None") == 0)
+	{
+		*theFXList = fxl;
+	}
+	// If FXList not found in release, leave pointer unchanged rather than assigning NULL
 
 } 
 
@@ -1281,9 +1294,13 @@ void INI::parseParticleSystemTemplate( INI *ini, void * /*instance*/, void *stor
 	DEBUG_ASSERTCRASH( pSystemT || stricmp( token, "None" ) == 0, ("ParticleSystem %s not found!\n",token) );
 
 	typedef const ParticleSystemTemplate* ConstParticleSystemTemplatePtr;
-	ConstParticleSystemTemplatePtr* theParticleSystemTemplate = (ConstParticleSystemTemplatePtr*)store;		
+	ConstParticleSystemTemplatePtr* theParticleSystemTemplate = (ConstParticleSystemTemplatePtr*)store;
 
-	*theParticleSystemTemplate = pSystemT;
+	if (pSystemT || stricmp(token, "None") == 0)
+	{
+		*theParticleSystemTemplate = pSystemT;
+	}
+	// If particle system not found in release, leave pointer unchanged rather than assigning NULL
 
 }  // end parseParticleSystemTemplate
 
@@ -1305,8 +1322,11 @@ void INI::parseDamageFX( INI* ini, void * /*instance*/, void *store, const void*
 	{
 		const DamageFX *fxl = TheDamageFXStore->findDamageFX(token);	// could be null!
 		DEBUG_ASSERTCRASH(fxl, ("DamageFX %s not found!\n",token));
-		// assign it, even if null!
-		*theDamageFX = fxl;
+		if (fxl)
+		{
+			*theDamageFX = fxl;
+		}
+		// If DamageFX not found in release, leave pointer unchanged rather than assigning NULL
 	}
 
 } 
@@ -1323,8 +1343,11 @@ void INI::parseObjectCreationList( INI* ini, void * /*instance*/, void *store, c
 
 	const ObjectCreationList *ocl = TheObjectCreationListStore->findObjectCreationList(token);	// could be null!
 	DEBUG_ASSERTCRASH(ocl || stricmp(token, "None") == 0, ("ObjectCreationList %s not found!\n",token));
-	// assign it, even if null!
-	*theObjectCreationList = ocl;
+	if (ocl || stricmp(token, "None") == 0)
+	{
+		*theObjectCreationList = ocl;
+	}
+	// If ObjectCreationList not found in release, leave pointer unchanged rather than assigning NULL
 
 } 
 
@@ -1345,8 +1368,12 @@ void INI::parseUpgradeTemplate( INI* ini, void * /*instance*/, void *store, cons
 	DEBUG_ASSERTCRASH( uu || stricmp( token, "None" ) == 0, ("Upgrade %s not found!\n",token) );
 
 	typedef const UpgradeTemplate* ConstUpgradeTemplatePtr;
-	ConstUpgradeTemplatePtr* theUpgradeTemplate = (ConstUpgradeTemplatePtr *)store;		
-	*theUpgradeTemplate = uu;
+	ConstUpgradeTemplatePtr* theUpgradeTemplate = (ConstUpgradeTemplatePtr *)store;
+	if (uu || stricmp(token, "None") == 0)
+	{
+		*theUpgradeTemplate = uu;
+	}
+	// If upgrade not found in release, leave pointer unchanged rather than assigning NULL
 } 
 
 //-------------------------------------------------------------------------------------------------
@@ -1369,8 +1396,12 @@ void INI::parseSpecialPowerTemplate( INI* ini, void * /*instance*/, void *store,
 	}
 
 	typedef const SpecialPowerTemplate* ConstSpecialPowerTemplatePtr;
-	ConstSpecialPowerTemplatePtr* theSpecialPowerTemplate = (ConstSpecialPowerTemplatePtr *)store;		
-	*theSpecialPowerTemplate = sPowerT;
+	ConstSpecialPowerTemplatePtr* theSpecialPowerTemplate = (ConstSpecialPowerTemplatePtr *)store;
+	if (sPowerT || stricmp(token, "None") == 0)
+	{
+		*theSpecialPowerTemplate = sPowerT;
+	}
+	// If special power not found in release, leave pointer unchanged rather than assigning NULL
 } 
 
 //-------------------------------------------------------------------------------------------------

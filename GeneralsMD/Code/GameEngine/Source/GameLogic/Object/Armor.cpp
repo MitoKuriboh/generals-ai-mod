@@ -64,18 +64,22 @@ void ArmorTemplate::clear()
 }
 
 //-------------------------------------------------------------------------------------------------
-Real ArmorTemplate::adjustDamage(DamageType t, Real damage) const 
-{ 
+Real ArmorTemplate::adjustDamage(DamageType t, Real damage) const
+{
 	if (t == DAMAGE_UNRESISTABLE)
 		return damage;
 	if (t == DAMAGE_SUBDUAL_UNRESISTABLE)
+		return damage;
+
+	// Bounds check on damage type index
+	if (t < 0 || t >= DAMAGE_NUM_TYPES)
 		return damage;
 
 	damage *= m_damageCoefficient[t];
 
 	if (damage < 0.0f)
 		damage = 0.0f;
-	
+
 	return damage;
 }
 

@@ -103,6 +103,9 @@ static BodyDamageType calcDamageState(Real health, Real maxHealth)
 	if (!TheGlobalData)
 		return BODY_PRISTINE;
 
+	if (maxHealth <= 0.0f)
+		return BODY_PRISTINE;
+
 	Real ratio = health / maxHealth;
 
 	if (ratio > TheGlobalData->m_unitDamagedThresh)
@@ -167,6 +170,12 @@ ActiveBody::ActiveBody( Thing *thing, const ModuleData* moduleData ) :
 	m_prevHealth = getActiveBodyModuleData()->m_initialHealth;
 	m_maxHealth = getActiveBodyModuleData()->m_maxHealth;
 	m_initialHealth = getActiveBodyModuleData()->m_initialHealth;
+
+	// Validate maxHealth to prevent division by zero in damage calculations
+	if (m_maxHealth <= 0.0f)
+	{
+		m_maxHealth = 1.0f;
+	}
 
 	// force an initially-valid armor setup
 	validateArmorAndDamageFX();
@@ -438,8 +447,9 @@ void ActiveBody::attemptDamage( DamageInfo *damageInfo )
 			// Multiple damages applied in one/next frame.  We prefer the one that tells who the attacker is.
 			Object *srcObj1 = TheGameLogic->findObjectByID(m_lastDamageInfo.in.m_sourceID);
 			Object *srcObj2 = TheGameLogic->findObjectByID(damageInfo->in.m_sourceID);
-			if (srcObj2) {
-				if (srcObj1) {
+			// Check that objects still exist and are not effectively dead before accessing properties
+			if (srcObj2 && !srcObj2->isEffectivelyDead()) {
+				if (srcObj1 && !srcObj1->isEffectivelyDead()) {
 					if (srcObj2->isKindOf(KINDOF_VEHICLE) || srcObj2->isKindOf(KINDOF_INFANTRY) ||
 						srcObj2->isFactionStructure()) {
 							m_lastDamageInfo = *damageInfo;

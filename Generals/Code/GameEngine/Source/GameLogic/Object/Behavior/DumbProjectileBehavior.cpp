@@ -504,11 +504,14 @@ Bool DumbProjectileBehavior::projectileHandleCollision( Object *other )
 				if (numKilled > 0)
 				{
 					// note, fx is played at center of building, not at grenade's location
-					FXList::doFXObj(d->m_garrisonHitKillFX, other, NULL);
+					if (d->m_garrisonHitKillFX && other)
+					{
+						FXList::doFXObj(d->m_garrisonHitKillFX, other, NULL);
+					}
 
 					// don't do the normal explosion; just destroy ourselves & return
 					TheGameLogic->destroyObject(getObject());
-					
+
 					return true;
 				}
 			}	// if a garrisonable thing

@@ -55,22 +55,27 @@ NetCommandRef * NetPacket::ConstructNetCommandMsgFromRawData(UnsignedByte *data,
 	while ((offset < (Int)dataLength) && notDone) {
 		if (data[offset] == 'T') {
 			++offset;
+			if (offset + (Int)sizeof(UnsignedByte) > (Int)dataLength) break;  // Bounds check
 			memcpy(&commandType, data + offset, sizeof(UnsignedByte));
 			offset += sizeof(UnsignedByte);
 		} else if (data[offset] == 'R') {
 			++offset;
+			if (offset + (Int)sizeof(UnsignedByte) > (Int)dataLength) break;  // Bounds check
 			memcpy(&relay, data + offset, sizeof(UnsignedByte));
 			offset += sizeof(UnsignedByte);
 		} else if (data[offset] == 'P') {
 			++offset;
+			if (offset + (Int)sizeof(UnsignedByte) > (Int)dataLength) break;  // Bounds check
 			memcpy(&playerID, data + offset, sizeof(UnsignedByte));
 			offset += sizeof(UnsignedByte);
 		} else if (data[offset] == 'C') {
 			++offset;
+			if (offset + (Int)sizeof(UnsignedShort) > (Int)dataLength) break;  // Bounds check
 			memcpy(&commandID, data + offset, sizeof(UnsignedShort));
 			offset += sizeof(UnsignedShort);
 		} else if (data[offset] == 'F') {
 			++offset;
+			if (offset + (Int)sizeof(UnsignedInt) > (Int)dataLength) break;  // Bounds check
 			memcpy(&frame, data + offset, sizeof(UnsignedInt));
 			offset += sizeof(UnsignedInt);
 		} else if (data[offset] == 'D') {

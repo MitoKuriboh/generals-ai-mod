@@ -4084,7 +4084,10 @@ void Object::xfer( Xfer *xfer )
 	{
 
 		// change the ID of the drawable attached to be the same ID as it was when it was saved
-		draw->setID( drawableID );
+		if (draw)
+		{
+			draw->setID( drawableID );
+		}
 
 	}  // end if
 
@@ -4220,6 +4223,11 @@ void Object::xfer( Xfer *xfer )
 
 		xfer->xferObjectID( &m_xferContainedByID );
 	}
+	else if( xfer->getXferMode() == XFER_LOAD )
+	{
+		// Ensure m_xferContainedByID is explicitly set for old saves
+		m_xferContainedByID = INVALID_ID;
+	}
 
 	// contained by frame
 	xfer->xferUnsignedInt( &m_containedByFrame );
@@ -4261,8 +4269,22 @@ void Object::xfer( Xfer *xfer )
 			// CBD (11-13-2002) I'm disabling this because it appears there might be some areas with
 			// empty names, see John A. for more info
 			//
-			//if (triggerName.isNotEmpty())
-			  m_triggerInfo[i].pTrigger = TheTerrainLogic->getTriggerAreaByName(triggerName);
+			if (triggerName.isNotEmpty())
+			{
+				m_triggerInfo[i].pTrigger = TheTerrainLogic->getTriggerAreaByName(triggerName);
+				// Handle missing trigger area gracefully
+				if (m_triggerInfo[i].pTrigger == NULL)
+				{
+					DEBUG_LOG(("Object::xfer - trigger area '%s' not found, clearing trigger info", triggerName.str()));
+					m_triggerInfo[i].entered = 0;
+					m_triggerInfo[i].exited = 0;
+					m_triggerInfo[i].isInside = 0;
+				}
+			}
+			else
+			{
+				m_triggerInfo[i].pTrigger = NULL;
+			}
 		}
 		xfer->xferByte(&m_triggerInfo[i].entered);
 		xfer->xferByte(&m_triggerInfo[i].exited);
@@ -4444,9 +4466,19 @@ void Object::xfer( Xfer *xfer )
 void Object::loadPostProcess()
 {
 	if( m_xferContainedByID != INVALID_ID )
+	{
 		m_containedBy = TheGameLogic->findObjectByID(m_xferContainedByID);
+		// Validate the contained-by object still exists after load
+		if (m_containedBy == NULL)
+		{
+			DEBUG_LOG(("Object::loadPostProcess - containedBy object ID %d not found, clearing reference", m_xferContainedByID));
+			m_xferContainedByID = INVALID_ID;
+		}
+	}
 	else
+	{
 		m_containedBy = NULL;
+	}
 
 }  // end loadPostProcess
 

@@ -1567,8 +1567,8 @@ Bool Locomotor::fixInvalidPosition(Object* obj, PhysicsBehavior *physics)
 			// It was already leaving.
 			return false;
 		}
-		
-		
+
+
 		// Kill current accel
 		//physics->clearAcceleration();
 
@@ -1583,6 +1583,31 @@ Bool Locomotor::fixInvalidPosition(Object* obj, PhysicsBehavior *physics)
 		physics->applyMotiveForce(&correction);
 		return true;
 	}
+
+	// If dx and dy are both 0, all 9 cells may be uniformly invalid (forces cancelled out).
+	// Try expanded search to find a valid cell direction to push toward.
+	for (Int radius = 2; radius <= 4; radius++) {
+		for (j=-radius; j<=radius; j++) {
+			for (i=-radius; i<=radius; i++) {
+				// Skip inner cells already checked
+				if (abs(i) < radius && abs(j) < radius) continue;
+
+				Coord3D thePos = *obj->getPosition();
+				thePos.x += i*PATHFIND_CELL_SIZE_F;
+				thePos.y += j*PATHFIND_CELL_SIZE_F;
+				if (TheAI->pathfinder()->validMovementTerrain(obj->getLayer(), this, &thePos)) {
+					// Found a valid cell - push toward it
+					Coord3D correction;
+					correction.x = i*physics->getMass()/10;
+					correction.y = j*physics->getMass()/10;
+					correction.z = 0;
+					physics->applyMotiveForce(&correction);
+					return true;
+				}
+			}
+		}
+	}
+
 	return false;
 #endif
 }
