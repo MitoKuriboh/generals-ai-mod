@@ -62,9 +62,9 @@ class RuleBasedMicro:
                 return MicroAction.ATTACK_CURRENT, 0.0, 0.0
 
         # Priority 3: Kite if low health and enemy close
+        # Kite immediately when ranged - don't wait to be shot first (BUG #4 fix)
         if state.health < self.low_health and state.nearest_enemy_dist < self.kite_range:
-            if state.under_fire > 0.5:
-                # Attack then move backward
+            if state.attack_range > 0.5:  # Ranged units kite immediately
                 return self._kiting_action(state)
 
         # Priority 4: Focus fire on weak enemies
@@ -73,8 +73,8 @@ class RuleBasedMicro:
 
         # Priority 5: Under fire - decide between attack and kite
         if state.under_fire > 0.5:
-            # If we have range advantage, kite
-            if state.attack_range > 0.6 and state.nearest_enemy_dist < self.kite_range:
+            # If we have range advantage, kite (H1 fix: aligned threshold to 0.5)
+            if state.attack_range > 0.5 and state.nearest_enemy_dist < self.kite_range:
                 return self._kiting_action(state)
             # Otherwise, stand and fight
             return MicroAction.ATTACK_CURRENT, 0.0, 0.0
