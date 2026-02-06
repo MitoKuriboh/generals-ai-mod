@@ -443,7 +443,10 @@ class HierarchicalInferenceServer:
             return True
         version = state.get('version', 1)
         if version != PROTOCOL_VERSION:
-            print(f"[!] Protocol mismatch: expected {PROTOCOL_VERSION}, got {version}")
+            # M4 FIX: Fail fast on protocol mismatch instead of continuing silently
+            error_msg = f"Protocol mismatch: expected v{PROTOCOL_VERSION}, got v{version}"
+            print(f"[!] FATAL: {error_msg}")
+            raise ValueError(error_msg)  # Will be caught by exception handler and send error response
         else:
             print(f"[OK] Protocol v{version}")
         self._protocol_validated = True
@@ -520,12 +523,29 @@ def main():
                 server.write_message(json.dumps(response))
             except json.JSONDecodeError as e:
                 print(f"[!] Bad JSON: {e}")
+                # H7 FIX: Send error response instead of silently disconnecting
+                error_response = {
+                    'error': True,
+                    'message': f'Invalid JSON: {str(e)}',
+                    'version': PROTOCOL_VERSION
+                }
+                server.write_message(json.dumps(error_response))
                 server.connected = False
                 break
             except Exception as e:
                 print(f"[!] Error: {e}")
                 import traceback
                 traceback.print_exc()
+                # H7 FIX: Always send error response - don't leave C++ waiting
+                error_response = {
+                    'error': True,
+                    'message': f'Server error: {str(e)}',
+                    'version': PROTOCOL_VERSION
+                }
+                if not server.write_message(json.dumps(error_response)):
+                    # Write failed, connection probably dead
+                    server.connected = False
+                    break
 
         print(f"\n[Server] Disconnected after {server.state_count} requests")
         server.close()

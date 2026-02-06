@@ -615,6 +615,7 @@ void AILearningPlayer::buildGameState(MLGameState& state)
 	// Supply usage
 	state.supplyUsed = calculateSupplyUsed();
 
+	// Count forces
 	// Count forces - M2 FIX: Single-pass counting for both own and enemy forces
 	countAllForces(state);
 
@@ -1721,23 +1722,10 @@ void AILearningPlayer::executeMicroCommand(Object* unit, const MicroCommand& cmd
 
 		case MICRO_MOVE_FORWARD: {
 			// Move in specified direction
-			// FIX A4: Validate and clamp moveAngle and moveDistance from server
-			Real angle = cmd.moveAngle;
-			Real dist = cmd.moveDistance;
-
-			// Handle NaN/Inf with safe defaults
-			if (angle != angle || dist != dist) {  // NaN check
-				break;  // Skip invalid command
-			}
-
-			angle = fmodf(angle, 2.0f * 3.14159265f);  // Wrap to valid range
-			if (dist < 0.0f) dist = 0.0f;
-			if (dist > 1.0f) dist = 1.0f;
-
 			Coord3D movePos;
-			Real moveDist = dist * 100.0f;  // Scale to game units
-			movePos.x = unitPos->x + cosf(angle) * moveDist;
-			movePos.y = unitPos->y + sinf(angle) * moveDist;
+			Real moveDist = cmd.moveDistance * 100.0f;  // Scale to game units
+			movePos.x = unitPos->x + cosf(cmd.moveAngle) * moveDist;
+			movePos.y = unitPos->y + sinf(cmd.moveAngle) * moveDist;
 			movePos.z = unitPos->z;
 			ai->aiMoveToPosition(&movePos, CMD_FROM_AI);
 			break;
@@ -1749,12 +1737,9 @@ void AILearningPlayer::executeMicroCommand(Object* unit, const MicroCommand& cmd
 			Object* enemy = findNearestEnemy(unit, &enemyDist, &enemyAngle);
 			if (enemy) {
 				const Coord3D* enemyPos = enemy->getPosition();
-				// FIX A3: Null check for enemyPos before calculating kite position
-				if (enemyPos) {
-					Coord3D kitePos;
-					calculateKitePosition(unit, enemyPos, &kitePos);
-					ai->aiMoveToPosition(&kitePos, CMD_FROM_AI);
-				}
+				Coord3D kitePos;
+				calculateKitePosition(unit, enemyPos, &kitePos);
+				ai->aiMoveToPosition(&kitePos, CMD_FROM_AI);
 			}
 			break;
 		}
@@ -1765,12 +1750,9 @@ void AILearningPlayer::executeMicroCommand(Object* unit, const MicroCommand& cmd
 			Object* enemy = findNearestEnemy(unit, &enemyDist, &enemyAngle);
 			if (enemy) {
 				const Coord3D* enemyPos = enemy->getPosition();
-				// FIX A3: Null check for enemyPos before calculating flank position
-				if (enemyPos) {
-					Coord3D flankPos;
-					calculateFlankPosition(unit, enemyPos, cmd.moveAngle > 0, &flankPos);
-					ai->aiMoveToPosition(&flankPos, CMD_FROM_AI);
-				}
+				Coord3D flankPos;
+				calculateFlankPosition(unit, enemyPos, cmd.moveAngle > 0, &flankPos);
+				ai->aiMoveToPosition(&flankPos, CMD_FROM_AI);
 			}
 			break;
 		}

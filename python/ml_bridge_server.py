@@ -25,6 +25,14 @@ import os
 import argparse
 from datetime import datetime
 
+# Add parent to path for imports
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+try:
+    from training.config import PROTOCOL_VERSION
+except ImportError:
+    PROTOCOL_VERSION = 2  # Fallback
+
 # Windows named pipe support
 if sys.platform == 'win32':
     import win32pipe
@@ -96,6 +104,7 @@ class MLBridgeServer:
         self.verbose = verbose
         self.respond = respond
         self.state_count = 0
+        self._protocol_validated = False  # FIX: Track protocol validation
 
     def create_pipe(self):
         """Create the named pipe server."""
@@ -356,6 +365,23 @@ class MLBridgeServer:
                   f"threat={state.get('base_threat', 0):3.0%} "
                   f"{'ATTACK!' if state.get('under_attack', 0) > 0.5 else ''}")
 
+    def validate_protocol_version(self, state):
+        """Validate protocol version from game state. Returns True if valid."""
+        if self._protocol_validated:
+            return True
+
+        version = state.get('version', 1)
+        if version != PROTOCOL_VERSION:
+            # M4 FIX: Fail fast on protocol mismatch instead of continuing silently
+            error_msg = f"Protocol mismatch: expected v{PROTOCOL_VERSION}, got v{version}"
+            print(f"[Server] FATAL: {error_msg}")
+            raise ValueError(error_msg)  # Will be caught by caller and handled appropriately
+        else:
+            print(f"[Server] Protocol version {version} validated")
+
+        self._protocol_validated = True
+        return True
+
     def close(self):
         """Close the pipe."""
         if self.pipe and sys.platform == 'win32':
@@ -363,6 +389,7 @@ class MLBridgeServer:
             self.pipe = None
         self.connected = False
         self.state_count = 0
+        self._protocol_validated = False  # Reset for next connection
 
 
 def main():
@@ -415,6 +442,9 @@ def main():
 
             try:
                 state = json.loads(msg)
+
+                # FIX: Validate protocol version on first state
+                server.validate_protocol_version(state)
 
                 # Generate recommendation
                 rec = server.generate_recommendation(state) if server.respond else None

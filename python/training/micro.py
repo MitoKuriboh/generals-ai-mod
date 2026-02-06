@@ -165,6 +165,8 @@ class MicroDecisionMaker:
     KITE_RANGE = 0.35       # Enemy distance threshold for kiting (normalized)
     FOCUS_THRESHOLD = 0.3   # Attack weakest if enemy health below this
     RANGED_THRESHOLD = 0.5  # Consider unit ranged if range > this
+    COVER_THRESHOLD = 0.5   # Consider unit in cover if above this (H1 fix)
+    CAN_RETREAT_THRESHOLD = 0.5  # Retreat path clear if above this (H2 fix)
 
     def __init__(self, verbose: bool = False):
         self.verbose = verbose
@@ -180,10 +182,17 @@ class MicroDecisionMaker:
         - Unit type (ranged vs melee)
         - Ability availability
         - Retreat path availability
+        - Cover status (H1 fix)
         """
+        # Pre-compute commonly used conditions
+        is_ranged = state.attack_range > self.RANGED_THRESHOLD
+        enemy_close = state.nearest_enemy_dist < self.KITE_RANGE
+        in_cover = state.in_cover > self.COVER_THRESHOLD  # H1: Track cover status
+        can_retreat = state.can_retreat > self.CAN_RETREAT_THRESHOLD  # H2: Track retreat path
+
         # === PRIORITY 1: Critical health - RETREAT ===
         if state.health < self.CRITICAL_HEALTH:
-            if state.can_retreat > 0.5:
+            if can_retreat:
                 return self._retreat(state, "Critical health")
             else:
                 # Can't retreat, fight to death
@@ -195,28 +204,43 @@ class MicroDecisionMaker:
             if state.under_fire > 0.5 or state.target_dist < 0.8:
                 return self._use_ability(state, "Ability ready in combat")
 
-        # === PRIORITY 3: Kite if low health + ranged + enemy close ===
-        is_ranged = state.attack_range > self.RANGED_THRESHOLD
-        enemy_close = state.nearest_enemy_dist < self.KITE_RANGE
+        # === PRIORITY 3: Cover-aware behavior (H1 fix) ===
+        # If in good cover, adopt defensive stance - don't kite away from cover
+        if in_cover:
+            if state.under_fire > 0.5:
+                # Under fire but in cover - hold position and fight
+                return self._attack_current(state, "Holding cover position")
+            elif state.health < self.LOW_HEALTH:
+                # Low health but in cover - stay put, don't expose by kiting
+                return self._attack_current(state, "Defending from cover (low HP)")
 
+        # === PRIORITY 4: Kite if low health + ranged + enemy close (H2 fix) ===
         if state.health < self.LOW_HEALTH and is_ranged and enemy_close:
-            # Kite immediately - don't wait to be shot first (BUG #4 fix)
-            return self._kite(state, "Low health kiting")
+            # H2: Only kite if we have a clear retreat path
+            if can_retreat:
+                return self._kite(state, "Low health kiting")
+            else:
+                # No retreat path - stand and fight
+                return self._attack_current(state, "No kite path, fighting")
 
-        # === PRIORITY 4: Focus fire on weak enemies ===
+        # === PRIORITY 5: Focus fire on weak enemies ===
         if state.nearest_enemy_health < self.FOCUS_THRESHOLD and state.nearest_enemy_health > 0:
             return self._attack_weakest(state, "Focus fire on weak")
 
-        # === PRIORITY 5: Hero hunting ===
+        # === PRIORITY 6: Hero hunting ===
         # target_type > 0.2 and < 0.3 indicates hero (based on getUnitTypeEncoding)
         if state.target_type > 0.2 and state.target_type < 0.3:
             return self._attack_priority(state, "Hunting hero target")
 
-        # === PRIORITY 6: Kite even at full health if ranged and enemy very close ===
+        # === PRIORITY 7: Kite even at full health if ranged and enemy very close (H2 fix) ===
         if is_ranged and state.nearest_enemy_dist < 0.2 and state.under_fire > 0.5:
-            return self._kite(state, "Range maintenance kiting")
+            # H2: Check can_retreat before range maintenance kiting
+            if can_retreat and not in_cover:  # H1: Don't leave cover for range maintenance
+                return self._kite(state, "Range maintenance kiting")
+            elif in_cover:
+                return self._attack_current(state, "Holding cover (enemy close)")
 
-        # === PRIORITY 7: Advance if enemy far and we're attacking ===
+        # === PRIORITY 8: Advance if enemy far and we're attacking ===
         if state.target_dist > 0.7 and state.time_in_combat > 0.3:
             return self._move_forward(state, "Closing distance")
 

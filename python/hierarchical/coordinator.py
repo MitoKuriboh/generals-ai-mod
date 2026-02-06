@@ -267,10 +267,10 @@ class HierarchicalCoordinator:
 
             # Handle raw array from C++ (list of 64 floats) vs structured dict
             if isinstance(team_data, list):
-                # Validate array size before using
+                # H6 FIX: Reject short arrays instead of silent padding
                 if len(team_data) < 64:
-                    logger.warning(f"Team {team_id} data has {len(team_data)} floats, expected 64. Padding with zeros.")
-                    team_data = team_data + [0.0] * (64 - len(team_data))
+                    logger.error(f"Team {team_id} data has {len(team_data)} floats, expected 64. Skipping (corrupted data).")
+                    continue  # Skip this team instead of using corrupted/padded data
                 # Raw 64-float array from C++ - use directly as tensor
                 state_tensor = torch.tensor(team_data[:64], dtype=torch.float32)
             elif isinstance(team_data, dict):
@@ -378,10 +378,10 @@ class HierarchicalCoordinator:
 
             # Handle raw array from C++ (list of 32 floats) vs structured dict
             if isinstance(unit_data, list):
-                # Validate array size before using
+                # H6 FIX: Reject short arrays instead of silent padding
                 if len(unit_data) < 32:
-                    logger.warning(f"Unit {unit_id} data has {len(unit_data)} floats, expected 32. Padding with zeros.")
-                    unit_data = unit_data + [0.0] * (32 - len(unit_data))
+                    logger.error(f"Unit {unit_id} data has {len(unit_data)} floats, expected 32. Skipping (corrupted data).")
+                    continue  # Skip this unit instead of using corrupted/padded data
                 # Raw 32-float array from C++ - use directly as tensor
                 state_tensor = torch.tensor(unit_data[:32], dtype=torch.float32).to(self.device)
             elif isinstance(unit_data, dict):
