@@ -8,6 +8,10 @@ Training stages:
 1. Freeze strategic, train tactical with strategic rewards
 2. Freeze strategic+tactical, train micro with tactical rewards
 3. Unfreeze all, joint fine-tuning with low LR
+
+Includes:
+- Adaptive curriculum learning (difficulty scales with performance)
+- Optional curiosity-driven exploration (RND)
 """
 
 import torch
@@ -15,8 +19,9 @@ import torch.nn as nn
 import torch.optim as optim
 import numpy as np
 from typing import Dict, List, Optional, Tuple
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from collections import deque
 
 # Import layer modules
 import sys
@@ -28,6 +33,130 @@ from tactical.model import TacticalNetwork
 from tactical.train import TacticalPPOAgent, TacticalPPOConfig
 from micro.model import MicroNetwork
 from micro.train import MicroPPOAgent, MicroPPOConfig
+
+
+class AdaptiveCurriculum:
+    """
+    Adaptive curriculum learning based on win rate.
+
+    Automatically increases difficulty when agent performs well,
+    and decreases when struggling. Prevents catastrophic forgetting
+    by maintaining performance thresholds.
+    """
+
+    # Difficulty levels
+    EASY = 0
+    MEDIUM = 1
+    HARD = 2
+    BRUTAL = 3
+
+    DIFFICULTY_NAMES = ['Easy', 'Medium', 'Hard', 'Brutal']
+
+    def __init__(
+        self,
+        initial_difficulty: int = 0,
+        window_size: int = 50,
+        promote_threshold: float = 0.75,  # Win rate to increase difficulty
+        demote_threshold: float = 0.35,   # Win rate to decrease difficulty
+        min_games_before_change: int = 20  # Minimum games before difficulty can change
+    ):
+        self.difficulty = initial_difficulty
+        self.window_size = window_size
+        self.promote_threshold = promote_threshold
+        self.demote_threshold = demote_threshold
+        self.min_games_before_change = min_games_before_change
+
+        self.win_history = deque(maxlen=window_size)
+        self.games_at_current_difficulty = 0
+        self.difficulty_history = [(0, initial_difficulty)]  # (episode, difficulty)
+
+    def update(self, won: bool, episode: int = 0) -> bool:
+        """
+        Update curriculum based on game outcome.
+
+        Args:
+            won: Whether the agent won
+            episode: Current episode number (for logging)
+
+        Returns:
+            True if difficulty changed
+        """
+        self.win_history.append(1 if won else 0)
+        self.games_at_current_difficulty += 1
+
+        # Need enough games to make a decision
+        if len(self.win_history) < self.min_games_before_change:
+            return False
+
+        if self.games_at_current_difficulty < self.min_games_before_change:
+            return False
+
+        win_rate = sum(self.win_history) / len(self.win_history)
+        changed = False
+
+        # Check for promotion
+        if win_rate >= self.promote_threshold and self.difficulty < self.BRUTAL:
+            self.difficulty += 1
+            self.win_history.clear()
+            self.games_at_current_difficulty = 0
+            self.difficulty_history.append((episode, self.difficulty))
+            changed = True
+            print(f"[Curriculum] Difficulty INCREASED to {self.DIFFICULTY_NAMES[self.difficulty]} "
+                  f"(win rate was {win_rate:.1%})")
+
+        # Check for demotion
+        elif win_rate <= self.demote_threshold and self.difficulty > self.EASY:
+            self.difficulty -= 1
+            self.win_history.clear()
+            self.games_at_current_difficulty = 0
+            self.difficulty_history.append((episode, self.difficulty))
+            changed = True
+            print(f"[Curriculum] Difficulty DECREASED to {self.DIFFICULTY_NAMES[self.difficulty]} "
+                  f"(win rate was {win_rate:.1%})")
+
+        return changed
+
+    def get_ai_difficulty(self) -> int:
+        """Get the game AI difficulty setting (0-2 for Easy/Medium/Hard)."""
+        # Map our difficulty to game AI difficulty
+        # BRUTAL uses Hard AI but with handicaps for us
+        return min(self.difficulty, 2)
+
+    def get_handicap(self) -> float:
+        """Get handicap multiplier for BRUTAL difficulty (resources, etc.)."""
+        if self.difficulty == self.BRUTAL:
+            return 0.75  # We get 75% resources, enemy gets 125%
+        return 1.0
+
+    @property
+    def current_difficulty_name(self) -> str:
+        return self.DIFFICULTY_NAMES[self.difficulty]
+
+    def get_stats(self) -> Dict:
+        """Get curriculum statistics."""
+        return {
+            'difficulty': self.difficulty,
+            'difficulty_name': self.current_difficulty_name,
+            'win_rate': sum(self.win_history) / len(self.win_history) if self.win_history else 0.0,
+            'games_at_difficulty': self.games_at_current_difficulty,
+            'total_difficulty_changes': len(self.difficulty_history) - 1,
+        }
+
+    def save_state(self) -> Dict:
+        """Save curriculum state for checkpointing."""
+        return {
+            'difficulty': self.difficulty,
+            'win_history': list(self.win_history),
+            'games_at_current_difficulty': self.games_at_current_difficulty,
+            'difficulty_history': self.difficulty_history,
+        }
+
+    def load_state(self, state: Dict):
+        """Load curriculum state from checkpoint."""
+        self.difficulty = state['difficulty']
+        self.win_history = deque(state['win_history'], maxlen=self.window_size)
+        self.games_at_current_difficulty = state['games_at_current_difficulty']
+        self.difficulty_history = state['difficulty_history']
 
 
 @dataclass
@@ -64,6 +193,15 @@ class JointTrainingConfig:
     # Updates
     num_epochs: int = 3
     batch_size: int = 64
+
+    # Curriculum learning
+    use_curriculum: bool = True
+    curriculum_promote_threshold: float = 0.75
+    curriculum_demote_threshold: float = 0.35
+
+    # Curiosity-driven exploration (RND)
+    use_curiosity: bool = False
+    curiosity_coef: float = 0.5
 
 
 class JointHierarchicalTrainer:
@@ -477,6 +615,8 @@ def train_joint(
     output_dir: str = 'checkpoints/joint',
     device: str = 'cpu',
     use_simulated: bool = True,
+    use_curriculum: bool = True,
+    use_curiosity: bool = False,
 ):
     """
     Joint fine-tuning of all three layers.
@@ -490,6 +630,8 @@ def train_joint(
         output_dir: Directory for checkpoints
         device: Device to train on
         use_simulated: Use SimulatedHierarchicalEnv instead of real game
+        use_curriculum: Enable adaptive curriculum learning
+        use_curiosity: Enable RND curiosity-driven exploration
     """
     from .sim_env import SimulatedHierarchicalEnv
 
@@ -519,10 +661,31 @@ def train_joint(
         micro_agent.load(micro_checkpoint)
 
     # Create joint trainer
-    config = JointTrainingConfig()
+    config = JointTrainingConfig(use_curriculum=use_curriculum, use_curiosity=use_curiosity)
     trainer = JointHierarchicalTrainer(
         strategic_agent, tactical_agent, micro_agent, config, device
     )
+
+    # Initialize curriculum if enabled
+    curriculum = None
+    if use_curriculum:
+        curriculum = AdaptiveCurriculum(
+            initial_difficulty=0,
+            promote_threshold=config.curriculum_promote_threshold,
+            demote_threshold=config.curriculum_demote_threshold,
+        )
+        print(f"Curriculum learning enabled, starting at {curriculum.current_difficulty_name}")
+
+    # Initialize curiosity if enabled
+    curiosity = None
+    if use_curiosity:
+        from training.curiosity import RNDCuriosity
+        curiosity = RNDCuriosity(
+            state_dim=44,
+            intrinsic_coef=config.curiosity_coef,
+            device=device
+        )
+        print("Curiosity-driven exploration (RND) enabled")
 
     # Create environment
     if use_simulated:
@@ -532,9 +695,10 @@ def train_joint(
         # Use real game environment for hierarchical training
         from .real_env import RealGameHierarchicalEnv
         print("Using RealGameHierarchicalEnv for training (requires game)")
+        ai_difficulty = curriculum.get_ai_difficulty() if curriculum else 0
         env = RealGameHierarchicalEnv(
             headless=True,
-            ai_difficulty=0,  # Start with Easy AI
+            ai_difficulty=ai_difficulty,
             map_name="Alpine Assault",
         )
 
@@ -544,11 +708,25 @@ def train_joint(
     wins = 0
 
     for episode in range(num_episodes):
+        # Update environment difficulty if using curriculum with real game
+        if curriculum and not use_simulated:
+            env.ai_difficulty = curriculum.get_ai_difficulty()
+
         reward, info = trainer.collect_episode(env)
         episode_rewards.append(reward)
 
-        if info.get('won'):
+        won = info.get('won', False)
+        if won:
             wins += 1
+
+        # Update curriculum
+        if curriculum:
+            curriculum.update(won, episode)
+
+        # Update curiosity module
+        if curiosity and len(trainer.strategic.buffer.states) > 0:
+            states_tensor = torch.stack(trainer.strategic.buffer.states)
+            curiosity.update(states_tensor)
 
         # Update all layers
         if (episode + 1) % 10 == 0:
@@ -559,17 +737,49 @@ def train_joint(
             recent_rewards = episode_rewards[-50:] if len(episode_rewards) >= 50 else episode_rewards
             avg_reward = sum(recent_rewards) / len(recent_rewards)
             win_rate = wins / (episode + 1) * 100
-            print(f"Episode {episode+1}/{num_episodes} | Reward: {reward:.2f} | "
-                  f"Avg: {avg_reward:.2f} | Win Rate: {win_rate:.1f}%")
+
+            log_msg = (f"Episode {episode+1}/{num_episodes} | Reward: {reward:.2f} | "
+                       f"Avg: {avg_reward:.2f} | Win Rate: {win_rate:.1f}%")
+
+            if curriculum:
+                log_msg += f" | Difficulty: {curriculum.current_difficulty_name}"
+
+            if curiosity:
+                curiosity_stats = curiosity.get_stats()
+                log_msg += f" | RND Loss: {curiosity_stats['rnd_avg_loss']:.4f}"
+
+            print(log_msg)
 
         # Save checkpoint
         if (episode + 1) % checkpoint_interval == 0:
             checkpoint_path = f"{output_dir}/joint_ep{episode+1}"
             trainer.save(checkpoint_path)
+
+            # Save curriculum state
+            if curriculum:
+                import json
+                with open(f"{checkpoint_path}_curriculum.json", 'w') as f:
+                    json.dump(curriculum.save_state(), f)
+
+            # Save curiosity module
+            if curiosity:
+                curiosity.save(f"{checkpoint_path}_curiosity.pt")
+
             print(f"Saved checkpoint: {checkpoint_path}")
 
     # Save final models
     trainer.save(f"{output_dir}/joint_final")
+
+    if curriculum:
+        import json
+        with open(f"{output_dir}/joint_final_curriculum.json", 'w') as f:
+            json.dump(curriculum.save_state(), f)
+        print(f"Final curriculum stats: {curriculum.get_stats()}")
+
+    if curiosity:
+        curiosity.save(f"{output_dir}/joint_final_curiosity.pt")
+        print(f"Final curiosity stats: {curiosity.get_stats()}")
+
     print(f"\nTraining complete. Final models saved to {output_dir}/joint_final")
 
     return trainer

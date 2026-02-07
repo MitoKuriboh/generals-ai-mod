@@ -53,10 +53,13 @@ class NamedPipeServer:
 
     PIPE_NAME = r'\\.\pipe\generals_ml_bridge'
     BUFFER_SIZE = 4096
+    HEARTBEAT_TIMEOUT = 5.0  # Seconds without heartbeat before considering connection dead
 
     def __init__(self):
         self.pipe = None
         self.connected = False
+        self.last_heartbeat_time = time.time()
+        self.heartbeat_count = 0
 
     def create(self) -> bool:
         """Create the named pipe server."""
@@ -144,7 +147,17 @@ class NamedPipeServer:
             result, msg_data = win32file.ReadFile(self.pipe, msg_length)
 
             # Parse JSON
-            return json.loads(msg_data.decode('utf-8'))
+            msg = json.loads(msg_data.decode('utf-8'))
+
+            # Handle heartbeat messages
+            if msg.get('type') == 'heartbeat':
+                self.last_heartbeat_time = time.time()
+                self.heartbeat_count += 1
+                # Respond with pong
+                self.write_message({'type': 'pong', 'frame': msg.get('frame', 0)})
+                return None  # Don't return heartbeats to caller
+
+            return msg
 
         except pywintypes.error as e:
             if e.args[0] in (109, 232):  # Broken pipe, pipe being closed
@@ -154,6 +167,26 @@ class NamedPipeServer:
         except json.JSONDecodeError as e:
             print(f"JSON parse error: {e}")
             return None
+
+    def check_heartbeat(self) -> bool:
+        """Check if connection is still alive based on heartbeat timing."""
+        if not self.connected:
+            return False
+
+        time_since_heartbeat = time.time() - self.last_heartbeat_time
+        if time_since_heartbeat > self.HEARTBEAT_TIMEOUT:
+            print(f"Heartbeat timeout ({time_since_heartbeat:.1f}s since last heartbeat)")
+            return False
+
+        return True
+
+    def get_heartbeat_stats(self) -> Dict[str, Any]:
+        """Get heartbeat statistics."""
+        return {
+            'connected': self.connected,
+            'heartbeat_count': self.heartbeat_count,
+            'time_since_last': time.time() - self.last_heartbeat_time if self.connected else -1,
+        }
 
     def write_message(self, data: Dict[str, Any]) -> bool:
         """Write a message to the pipe."""

@@ -3,6 +3,7 @@ Tactical Network for Team-Level Decision Making
 
 Architecture:
 - Input: 64 floats (team state + strategic embedding)
+- Attention: Multi-head attention over unit features (optional)
 - Hidden: 2x128 MLP with LayerNorm
 - Output: Hybrid action space
   - Discrete: 8 tactical actions (Categorical)
@@ -13,14 +14,20 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Categorical, Beta
-from typing import Tuple, Dict, Optional
+from typing import Tuple, Dict, Optional, List
 import numpy as np
+import math
 
 
 # State and action dimensions
 TACTICAL_STATE_DIM = 64
 TACTICAL_ACTION_DIM = 8  # Discrete actions
 TACTICAL_CONTINUOUS_DIM = 3  # target_x, target_y, attitude
+
+# Unit features within tactical state (for attention)
+# State layout: [strategy_emb(8), inf(3), veh(3), air(3), mixed(3), status(8), situational(16), objective(8), temporal(4)]
+UNIT_FEATURE_DIM = 12  # Each unit group has 3 features, 4 groups = 12
+UNIT_GROUPS = 4  # infantry, vehicles, aircraft, mixed
 
 
 class TacticalAction:
@@ -46,6 +53,132 @@ class TacticalAction:
         return f'UNKNOWN_{action_id}'
 
 
+class UnitAttention(nn.Module):
+    """
+    Multi-head attention over unit group features.
+
+    Learns to weight which unit types (infantry, vehicles, aircraft, mixed)
+    are most relevant for the current tactical decision.
+    """
+
+    def __init__(self, embed_dim: int = 64, num_heads: int = 4, dropout: float = 0.1):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+
+        assert self.head_dim * num_heads == embed_dim, "embed_dim must be divisible by num_heads"
+
+        # Project unit features to query, key, value
+        self.unit_proj = nn.Linear(3, embed_dim)  # 3 features per unit group
+
+        # Context embedding (strategy + status)
+        self.context_proj = nn.Linear(16, embed_dim)  # strategy(8) + status subset(8)
+
+        # Multi-head attention components
+        self.q_proj = nn.Linear(embed_dim, embed_dim)
+        self.k_proj = nn.Linear(embed_dim, embed_dim)
+        self.v_proj = nn.Linear(embed_dim, embed_dim)
+        self.out_proj = nn.Linear(embed_dim, embed_dim)
+
+        self.dropout = nn.Dropout(dropout)
+        self.scale = math.sqrt(self.head_dim)
+
+        # Layer norm
+        self.norm = nn.LayerNorm(embed_dim)
+
+    def forward(self, state: torch.Tensor) -> torch.Tensor:
+        """
+        Apply attention over unit features.
+
+        Args:
+            state: Full tactical state [batch_size, 64]
+
+        Returns:
+            Attention-weighted features [batch_size, embed_dim]
+        """
+        batch_size = state.size(0) if state.dim() > 1 else 1
+        if state.dim() == 1:
+            state = state.unsqueeze(0)
+
+        # Extract unit features from state
+        # Layout: strategy(8), inf(3), veh(3), air(3), mixed(3), status(8), ...
+        strategy_emb = state[:, :8]
+        infantry = state[:, 8:11]
+        vehicles = state[:, 11:14]
+        aircraft = state[:, 14:17]
+        mixed = state[:, 17:20]
+        status = state[:, 20:28]
+
+        # Stack unit groups: [batch, 4, 3]
+        units = torch.stack([infantry, vehicles, aircraft, mixed], dim=1)
+
+        # Project units to embed_dim: [batch, 4, embed_dim]
+        unit_embeddings = self.unit_proj(units)
+
+        # Create context query from strategy + status
+        context = torch.cat([strategy_emb, status], dim=-1)
+        context_emb = self.context_proj(context)  # [batch, embed_dim]
+
+        # Query is context, keys and values are unit embeddings
+        Q = self.q_proj(context_emb).unsqueeze(1)  # [batch, 1, embed_dim]
+        K = self.k_proj(unit_embeddings)  # [batch, 4, embed_dim]
+        V = self.v_proj(unit_embeddings)  # [batch, 4, embed_dim]
+
+        # Reshape for multi-head attention
+        Q = Q.view(batch_size, 1, self.num_heads, self.head_dim).transpose(1, 2)
+        K = K.view(batch_size, 4, self.num_heads, self.head_dim).transpose(1, 2)
+        V = V.view(batch_size, 4, self.num_heads, self.head_dim).transpose(1, 2)
+
+        # Scaled dot-product attention
+        attn_scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale  # [batch, heads, 1, 4]
+        attn_weights = F.softmax(attn_scores, dim=-1)
+        attn_weights = self.dropout(attn_weights)
+
+        # Apply attention
+        attn_output = torch.matmul(attn_weights, V)  # [batch, heads, 1, head_dim]
+
+        # Reshape and project
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, 1, self.embed_dim)
+        attn_output = self.out_proj(attn_output).squeeze(1)  # [batch, embed_dim]
+
+        # Add residual from context and normalize
+        output = self.norm(attn_output + context_emb)
+
+        return output
+
+    def get_attention_weights(self, state: torch.Tensor) -> torch.Tensor:
+        """Get attention weights for visualization."""
+        batch_size = state.size(0) if state.dim() > 1 else 1
+        if state.dim() == 1:
+            state = state.unsqueeze(0)
+
+        strategy_emb = state[:, :8]
+        infantry = state[:, 8:11]
+        vehicles = state[:, 11:14]
+        aircraft = state[:, 14:17]
+        mixed = state[:, 17:20]
+        status = state[:, 20:28]
+
+        units = torch.stack([infantry, vehicles, aircraft, mixed], dim=1)
+        unit_embeddings = self.unit_proj(units)
+
+        context = torch.cat([strategy_emb, status], dim=-1)
+        context_emb = self.context_proj(context)
+
+        Q = self.q_proj(context_emb).unsqueeze(1)
+        K = self.k_proj(unit_embeddings)
+
+        Q = Q.view(batch_size, 1, self.num_heads, self.head_dim).transpose(1, 2)
+        K = K.view(batch_size, 4, self.num_heads, self.head_dim).transpose(1, 2)
+
+        attn_scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
+        attn_weights = F.softmax(attn_scores, dim=-1)
+
+        # Average across heads: [batch, 4]
+        return attn_weights.mean(dim=1).squeeze(1)
+
+
 class TacticalNetwork(nn.Module):
     """
     Actor-Critic network for tactical layer.
@@ -53,20 +186,41 @@ class TacticalNetwork(nn.Module):
     Uses hybrid action space:
     - Categorical distribution for discrete action selection
     - Beta distributions for continuous parameters (bounded [0,1])
+
+    Optional attention mechanism for unit-aware decisions.
     """
 
     def __init__(self, state_dim: int = TACTICAL_STATE_DIM,
                  num_actions: int = TACTICAL_ACTION_DIM,
-                 hidden_dim: int = 128):
+                 hidden_dim: int = 128,
+                 use_attention: bool = True,
+                 num_attention_heads: int = 4):
         super().__init__()
 
         self.state_dim = state_dim
         self.num_actions = num_actions
         self.hidden_dim = hidden_dim
+        self.use_attention = use_attention
+
+        # Optional attention layer for unit features
+        if use_attention:
+            self.attention = UnitAttention(
+                embed_dim=64,
+                num_heads=num_attention_heads,
+                dropout=0.1
+            )
+            # Combine attention output with non-unit state features
+            # State layout: strategy(8), units(12 = 4 groups x 3 features), rest(44)
+            # Attention output: 64, other features: strategy(8) + rest(44) = 52
+            # Combined: 64 + 52 = 116
+            combined_dim = 64 + 8 + (state_dim - 20)  # 64 + 8 + 44 = 116
+        else:
+            self.attention = None
+            combined_dim = state_dim
 
         # Shared feature extractor
         self.shared = nn.Sequential(
-            nn.Linear(state_dim, hidden_dim),
+            nn.Linear(combined_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
@@ -128,7 +282,24 @@ class TacticalNetwork(nn.Module):
             att_alpha, att_beta: [batch_size, 1] each
             value: [batch_size, 1]
         """
-        features = self.shared(state)
+        # Apply attention if enabled
+        if self.use_attention and self.attention is not None:
+            # Get attention-weighted unit features
+            attn_features = self.attention(state)  # [batch, 64]
+
+            # Get non-unit features (everything after unit groups)
+            # Layout: strategy(8), units(12), status(8), situational(16), objective(8), temporal(4)
+            # Units are at positions 8:20, rest is 0:8 and 20:64
+            if state.dim() == 1:
+                other_features = torch.cat([state[:8], state[20:]], dim=-1)
+            else:
+                other_features = torch.cat([state[:, :8], state[:, 20:]], dim=-1)
+
+            # Combine attention output with other features
+            combined = torch.cat([attn_features, other_features], dim=-1)
+            features = self.shared(combined)
+        else:
+            features = self.shared(state)
 
         action_logits = self.action_logits(features)
 
@@ -246,6 +417,7 @@ class TacticalNetwork(nn.Module):
             'state_dim': self.state_dim,
             'num_actions': self.num_actions,
             'hidden_dim': self.hidden_dim,
+            'use_attention': self.use_attention,
         }, path)
 
     @classmethod
@@ -256,15 +428,22 @@ class TacticalNetwork(nn.Module):
             state_dim=checkpoint.get('state_dim', TACTICAL_STATE_DIM),
             num_actions=checkpoint.get('num_actions', TACTICAL_ACTION_DIM),
             hidden_dim=checkpoint.get('hidden_dim', 128),
+            use_attention=checkpoint.get('use_attention', True),
         )
         # Handle both checkpoint formats
         if 'state_dict' in checkpoint:
-            model.load_state_dict(checkpoint['state_dict'])
+            model.load_state_dict(checkpoint['state_dict'], strict=False)
         elif 'policy_state_dict' in checkpoint:
-            model.load_state_dict(checkpoint['policy_state_dict'])
+            model.load_state_dict(checkpoint['policy_state_dict'], strict=False)
         else:
             raise KeyError(f"Checkpoint missing state_dict. Keys: {checkpoint.keys()}")
         return model
+
+    def get_attention_weights(self, state: torch.Tensor) -> Optional[torch.Tensor]:
+        """Get attention weights for visualization (unit importance)."""
+        if self.use_attention and self.attention is not None:
+            return self.attention.get_attention_weights(state)
+        return None
 
 
 def _sanitize_float(x, default: float = 0.5) -> float:
@@ -294,8 +473,10 @@ def action_dict_to_command(action_dict: Dict[str, torch.Tensor]) -> Dict[str, fl
 if __name__ == '__main__':
     print("Testing TacticalNetwork...")
 
-    model = TacticalNetwork()
-    print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
+    # Test with attention
+    print("\n=== Testing with Attention ===")
+    model = TacticalNetwork(use_attention=True)
+    print(f"Parameters (with attention): {sum(p.numel() for p in model.parameters()):,}")
 
     # Test forward pass
     state = torch.randn(TACTICAL_STATE_DIM)
@@ -306,6 +487,12 @@ if __name__ == '__main__':
     print(f"Attitude: {action_dict['attitude']:.3f}")
     print(f"Log prob: {log_prob:.3f}")
     print(f"Value: {value.item():.3f}")
+
+    # Test attention weights
+    attn_weights = model.get_attention_weights(state)
+    if attn_weights is not None:
+        print(f"\nAttention weights (infantry, vehicles, aircraft, mixed):")
+        print(f"  {attn_weights.squeeze().tolist()}")
 
     # Test batch processing
     states = torch.randn(32, TACTICAL_STATE_DIM)
@@ -319,5 +506,20 @@ if __name__ == '__main__':
     # Test deterministic
     action_dict_det, _, _ = model.get_action(state, deterministic=True)
     print(f"\nDeterministic action: {TacticalAction.name(action_dict_det['action'].item())}")
+
+    # Test without attention for comparison
+    print("\n=== Testing without Attention ===")
+    model_no_attn = TacticalNetwork(use_attention=False)
+    print(f"Parameters (no attention): {sum(p.numel() for p in model_no_attn.parameters()):,}")
+
+    action_dict2, _, _ = model_no_attn.get_action(state)
+    print(f"Action (no attention): {TacticalAction.name(action_dict2['action'].item())}")
+
+    # Test UnitAttention directly
+    print("\n=== Testing UnitAttention ===")
+    attention = UnitAttention(embed_dim=64, num_heads=4)
+    attn_out = attention(state)
+    print(f"Attention output shape: {attn_out.shape}")
+    print(f"Attention output norm: {attn_out.norm():.3f}")
 
     print("\nTacticalNetwork test passed!")

@@ -120,6 +120,7 @@ MLBridge::MLBridge() :
 	m_hasRecommendation(false),
 	m_lastConnectAttempt(0),
 	m_lastRecommendationFrame(0),
+	m_lastHeartbeatFrame(0),
 	m_trainerLaunched(false),
 	m_trainerProcess(NULL),
 	m_batchedModeEnabled(false),
@@ -903,6 +904,39 @@ MLRecommendation MLBridge::getValidRecommendation() const
 		return defaults;
 	}
 	return m_lastRecommendation;
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
+// Heartbeat Protocol
+///////////////////////////////////////////////////////////////////////////////////////////////////
+
+Bool MLBridge::sendHeartbeat()
+{
+	if (!m_connected) {
+		return false;
+	}
+
+	UnsignedInt currentFrame = TheGameLogic ? TheGameLogic->getFrame() : 0;
+
+	// Throttle heartbeats
+	if (currentFrame - m_lastHeartbeatFrame < HEARTBEAT_INTERVAL_FRAMES) {
+		return true;  // Not time yet, but not an error
+	}
+
+	m_lastHeartbeatFrame = currentFrame;
+
+	// Simple ping message
+	const char* ping = "{\"type\":\"heartbeat\",\"frame\":";
+	char buffer[64];
+	snprintf(buffer, sizeof(buffer), "%s%u}", ping, currentFrame);
+
+	Bool success = writeMessage(buffer, (UnsignedInt)strlen(buffer));
+
+	if (!success) {
+		DEBUG_LOG(("MLBridge: Heartbeat failed, connection may be lost\n"));
+	}
+
+	return success;
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////

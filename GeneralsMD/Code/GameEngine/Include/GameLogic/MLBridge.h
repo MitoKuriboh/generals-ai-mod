@@ -251,6 +251,9 @@ public:
 	// Check if recommendation is stale (hasn't been updated recently)
 	Bool isRecommendationStale() const;
 
+	// Send heartbeat ping to keep connection alive and detect issues early
+	Bool sendHeartbeat();
+
 	// FIX I1: Check for extended staleness and trigger reconnection if needed
 	Bool checkAndHandleStaleness();
 
@@ -309,11 +312,15 @@ private:
 	// FIX I4: Reduced from 300 (10 sec) to 60 (2 sec) for faster recovery
 	static const UnsignedInt RECONNECT_INTERVAL_FRAMES = 60; // ~2 seconds
 
-	// Recommendation staleness tracking
+	// Recommendation staleness tracking (reduced for faster recovery)
 	UnsignedInt m_lastRecommendationFrame;  // Frame when last recommendation received
-	static const UnsignedInt RECOMMENDATION_TIMEOUT_FRAMES = 60; // 2 seconds at 30 FPS
+	static const UnsignedInt RECOMMENDATION_TIMEOUT_FRAMES = 45; // 1.5 seconds at 30 FPS (was 60)
 	// FIX I1: Extended staleness threshold for alert/reconnection
-	static const UnsignedInt RECOMMENDATION_STALE_ALERT_FRAMES = 150; // 5 seconds - trigger reconnect
+	static const UnsignedInt RECOMMENDATION_STALE_ALERT_FRAMES = 90; // 3 seconds - trigger reconnect (was 150)
+
+	// Heartbeat tracking
+	UnsignedInt m_lastHeartbeatFrame;
+	static const UnsignedInt HEARTBEAT_INTERVAL_FRAMES = 30;  // Send heartbeat every 1 second
 
 	// Trainer process management
 	Bool m_trainerLaunched;
